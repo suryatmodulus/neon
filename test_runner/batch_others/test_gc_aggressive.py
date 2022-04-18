@@ -59,7 +59,7 @@ def test_gc_aggressive(zenith_simple_env: ZenithEnv):
     conn = pg.connect()
     cur = conn.cursor()
 
-    cur.execute("SHOW zenith.zenith_timeline")
+    cur.execute("SHOW neon.timelineid")
     timeline = cur.fetchone()[0]
 
     # Create table, and insert the first 100 rows
