@@ -49,7 +49,7 @@ use lazy_static::lazy_static;
 
 use utils::zid::{ZTenantId, ZTimelineId};
 
-use crate::shutdown_pageserver;
+use crate::{error, shutdown_pageserver};
 
 lazy_static! {
     /// Each thread that we track is associated with a "thread ID". It's just
@@ -141,7 +141,7 @@ pub fn spawn<F>(
     f: F,
 ) -> std::io::Result<()>
 where
-    F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    F: FnOnce() -> anyhow::Result<(), error::Error> + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
@@ -206,7 +206,7 @@ fn thread_wrapper<F>(
     shutdown_process_on_error: bool,
     f: F,
 ) where
-    F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    F: FnOnce() -> anyhow::Result<(), error::Error> + Send + 'static,
 {
     SHUTDOWN_RX.with(|rx| {
         *rx.borrow_mut() = Some(shutdown_rx);

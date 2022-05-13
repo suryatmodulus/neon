@@ -41,12 +41,12 @@ use crate::repository::{
     GcResult, Repository, RepositoryTimeline, Timeline, TimelineSyncStatusUpdate, TimelineWriter,
 };
 use crate::repository::{Key, Value};
-use crate::tenant_mgr;
 use crate::thread_mgr;
 use crate::virtual_file::VirtualFile;
 use crate::walreceiver::IS_WAL_RECEIVER;
 use crate::walredo::WalRedoManager;
 use crate::CheckpointConfig;
+use crate::{error, tenant_mgr};
 use crate::{page_cache, storage_sync};
 
 use metrics::{
@@ -1635,7 +1635,11 @@ impl LayeredTimeline {
                 Some(self.timeline_id),
                 "layer flush thread",
                 false,
-                move || self_clone.flush_frozen_layers(false),
+                move || {
+                    self_clone
+                        .flush_frozen_layers(false)
+                        .map_err(error::Error::from)
+                },
             )?;
         }
         Ok(())

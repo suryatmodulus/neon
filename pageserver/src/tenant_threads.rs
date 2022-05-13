@@ -1,8 +1,8 @@
 //! This module contains functions to serve per-tenant background processes,
 //! such as compaction and GC
 use crate::repository::Repository;
-use crate::tenant_mgr;
 use crate::tenant_mgr::TenantState;
+use crate::{error, tenant_mgr};
 use anyhow::Result;
 use std::time::Duration;
 use tracing::*;
@@ -11,10 +11,10 @@ use utils::zid::ZTenantId;
 ///
 /// Compaction thread's main loop
 ///
-pub fn compact_loop(tenantid: ZTenantId) -> Result<()> {
+pub fn compact_loop(tenantid: ZTenantId) -> Result<(), error::Error> {
     if let Err(err) = compact_loop_ext(tenantid) {
         error!("compact loop terminated with error: {:?}", err);
-        Err(err)
+        Err(err.into())
     } else {
         Ok(())
     }
@@ -47,7 +47,7 @@ fn compact_loop_ext(tenantid: ZTenantId) -> Result<()> {
 ///
 /// GC thread's main loop
 ///
-pub fn gc_loop(tenantid: ZTenantId) -> Result<()> {
+pub fn gc_loop(tenantid: ZTenantId) -> Result<(), error::Error> {
     loop {
         if tenant_mgr::get_tenant_state(tenantid) != Some(TenantState::Active) {
             break;

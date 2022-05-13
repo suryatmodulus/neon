@@ -11,7 +11,7 @@ use daemonize::Daemonize;
 use fail::FailScenario;
 use pageserver::{
     config::{defaults::*, PageServerConf},
-    http, page_cache, page_service, profiling, tenant_mgr, thread_mgr,
+    error, http, page_cache, page_service, profiling, tenant_mgr, thread_mgr,
     thread_mgr::ThreadKind,
     timelines, virtual_file, LOG_FILE_NAME,
 };
@@ -289,9 +289,10 @@ fn start_pageserver(conf: &'static PageServerConf, daemonize: bool) -> Result<()
         None,
         "http_endpoint_thread",
         true,
-        move || {
+        move || -> Result<(), error::Error> {
             let router = http::make_router(conf, auth_cloned, remote_index)?;
             endpoint::serve_thread_main(router, http_listener, thread_mgr::shutdown_watcher())
+                .map_err(error::Error::from)
         },
     )?;
 

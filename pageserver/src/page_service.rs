@@ -28,7 +28,6 @@ use utils::{
     zid::{ZTenantId, ZTimelineId},
 };
 
-use crate::basebackup;
 use crate::config::{PageServerConf, ProfilingConfig};
 use crate::pgdatadir_mapping::{DatadirTimeline, LsnForTimestamp};
 use crate::profiling::profpoint_start;
@@ -40,6 +39,7 @@ use crate::thread_mgr;
 use crate::thread_mgr::ThreadKind;
 use crate::walreceiver;
 use crate::CheckpointConfig;
+use crate::{basebackup, error};
 use metrics::{register_histogram_vec, HistogramVec};
 use postgres_ffi::xlog_utils::to_pg_timestamp;
 
@@ -214,16 +214,20 @@ pub fn thread_main(
     auth: Option<Arc<JwtAuth>>,
     listener: TcpListener,
     auth_type: AuthType,
-) -> anyhow::Result<()> {
-    listener.set_nonblocking(true)?;
+) -> anyhow::Result<(), error::Error> {
+    listener
+        .set_nonblocking(true)
+        .map_err(anyhow::Error::from)?;
     let basic_rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
-        .build()?;
+        .build()
+        .map_err(anyhow::Error::from)?;
 
     let tokio_listener = {
         let _guard = basic_rt.enter();
         tokio::net::TcpListener::from_std(listener)
-    }?;
+    }
+    .map_err(anyhow::Error::from)?;
 
     // Wait for a new connection to arrive, or for server shutdown.
     while let Some(res) = basic_rt.block_on(async {
@@ -280,7 +284,7 @@ fn page_service_conn_main(
     auth: Option<Arc<JwtAuth>>,
     socket: tokio::net::TcpStream,
     auth_type: AuthType,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(), error::Error> {
     // Immediately increment the gauge, then create a job to decrement it on thread exit.
     // One of the pros of `defer!` is that this will *most probably*
     // get called, even in presence of panics.
@@ -304,8 +308,10 @@ fn page_service_conn_main(
         .context("could not set TCP_NODELAY")?;
 
     let mut conn_handler = PageServerHandler::new(conf, auth);
-    let pgbackend = PostgresBackend::new(socket, auth_type, None, true)?;
-    pgbackend.run(&mut conn_handler)
+    let pgbackend =
+        PostgresBackend::new(socket, auth_type, None, true).map_err(anyhow::Error::from)?;
+    pgbackend.run(&mut conn_handler)?;
+    Ok(())
 }
 
 #[derive(Debug)]
