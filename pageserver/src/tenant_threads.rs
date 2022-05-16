@@ -14,7 +14,7 @@ use utils::zid::ZTenantId;
 pub fn compact_loop(tenantid: ZTenantId) -> Result<(), error::Error> {
     if let Err(err) = compact_loop_ext(tenantid) {
         error!("compact loop terminated with error: {:?}", err);
-        Err(err.into())
+        Err(error::Error::Internal(err))
     } else {
         Ok(())
     }

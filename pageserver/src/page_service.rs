@@ -320,7 +320,7 @@ fn page_service_conn_main(
         if let Some(io::ErrorKind::ConnectionReset) = root_cause_io_err_kind {
             PostgresIOError::ConnectionReset
         } else {
-            err.into()
+            PostgresIOError::Internal(err)
         }
     })?;
     Ok(())
