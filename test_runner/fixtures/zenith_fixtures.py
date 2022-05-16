@@ -558,7 +558,7 @@ class ZenithEnv:
                                port=self.port_distributor.get_port(),
                                peer_port=self.port_distributor.get_port())
             toml += textwrap.dedent(f"""
-            broker_endpoints = 'http://127.0.0.1:{self.broker.port}'
+            broker_endpoints = ['http://127.0.0.1:{self.broker.port}']
         """)
 
         # Create config for pageserver
@@ -780,6 +780,15 @@ class ZenithPageserverHttpClient(requests.Session):
     def timeline_detail(self, tenant_id: uuid.UUID, timeline_id: uuid.UUID) -> Dict[Any, Any]:
         res = self.get(
             f"http://localhost:{self.port}/v1/tenant/{tenant_id.hex}/timeline/{timeline_id.hex}?include-non-incremental-logical-size=1"
+        )
+        self.verbose_error(res)
+        res_json = res.json()
+        assert isinstance(res_json, dict)
+        return res_json
+
+    def wal_receiver_get(self, tenant_id: uuid.UUID, timeline_id: uuid.UUID) -> Dict[Any, Any]:
+        res = self.get(
+            f"http://localhost:{self.port}/v1/tenant/{tenant_id.hex}/timeline/{timeline_id.hex}/wal_receiver"
         )
         self.verbose_error(res)
         res_json = res.json()
