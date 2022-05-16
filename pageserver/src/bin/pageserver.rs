@@ -284,10 +284,10 @@ fn start_pageserver(conf: &'static PageServerConf, daemonize: bool) -> Result<()
         None,
         "http_endpoint_thread",
         true,
-        move || -> Result<(), error::Error> {
+        move || -> Result<(), error::PageServerError> {
             let router = http::make_router(conf, auth_cloned, remote_index)?;
             endpoint::serve_thread_main(router, http_listener, thread_mgr::shutdown_watcher())
-                .map_err(error::Error::from)
+                .map_err(error::PageServerError::from)
         },
     )?;
 

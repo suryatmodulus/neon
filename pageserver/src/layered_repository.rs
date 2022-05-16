@@ -1638,7 +1638,7 @@ impl LayeredTimeline {
                 move || {
                     self_clone
                         .flush_frozen_layers(false)
-                        .map_err(error::Error::from)
+                        .map_err(error::PageServerError::from)
                 },
             )?;
         }

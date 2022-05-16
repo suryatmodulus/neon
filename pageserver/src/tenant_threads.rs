@@ -11,10 +11,10 @@ use utils::zid::ZTenantId;
 ///
 /// Compaction thread's main loop
 ///
-pub fn compact_loop(tenantid: ZTenantId) -> Result<(), error::Error> {
+pub fn compact_loop(tenantid: ZTenantId) -> Result<(), error::PageServerError> {
     if let Err(err) = compact_loop_ext(tenantid) {
         error!("compact loop terminated with error: {:?}", err);
-        Err(error::Error::Internal(err))
+        Err(error::PageServerError::Internal(err))
     } else {
         Ok(())
     }
@@ -47,7 +47,7 @@ fn compact_loop_ext(tenantid: ZTenantId) -> Result<()> {
 ///
 /// GC thread's main loop
 ///
-pub fn gc_loop(tenantid: ZTenantId) -> Result<(), error::Error> {
+pub fn gc_loop(tenantid: ZTenantId) -> Result<(), error::PageServerError> {
     loop {
         if tenant_mgr::get_tenant_state(tenantid) != Some(TenantState::Active) {
             break;

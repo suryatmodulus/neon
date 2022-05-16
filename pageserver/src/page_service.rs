@@ -215,7 +215,7 @@ pub fn thread_main(
     auth: Option<Arc<JwtAuth>>,
     listener: TcpListener,
     auth_type: AuthType,
-) -> anyhow::Result<(), error::Error> {
+) -> anyhow::Result<(), error::PageServerError> {
     listener
         .set_nonblocking(true)
         .map_err(anyhow::Error::from)?;
@@ -285,7 +285,7 @@ fn page_service_conn_main(
     auth: Option<Arc<JwtAuth>>,
     socket: tokio::net::TcpStream,
     auth_type: AuthType,
-) -> anyhow::Result<(), error::Error> {
+) -> anyhow::Result<(), error::PageServerError> {
     // Immediately increment the gauge, then create a job to decrement it on thread exit.
     // One of the pros of `defer!` is that this will *most probably*
     // get called, even in presence of panics.
@@ -318,9 +318,9 @@ fn page_service_conn_main(
             .map(|e| e.kind());
 
         if let Some(io::ErrorKind::ConnectionReset) = root_cause_io_err_kind {
-            PostgresIOError::ConnectionReset
+            error::PageServerError::PostgresIO(PostgresIOError::ConnectionReset)
         } else {
-            PostgresIOError::Internal(err)
+            error::PageServerError::Internal(err)
         }
     })?;
     Ok(())
