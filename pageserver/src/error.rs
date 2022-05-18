@@ -15,7 +15,7 @@ pub enum PageServerError {
 }
 
 #[derive(Debug, Error)]
-/// The error type for I/O operations with the Postgres client.
+/// The error type for network operations
 pub enum NetworkError {
     #[error("Connection reset by peer")]
     ConnectionReset,
