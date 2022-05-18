@@ -29,7 +29,7 @@ use utils::{
 };
 
 use crate::config::{PageServerConf, ProfilingConfig};
-use crate::error::PostgresIOError;
+use crate::error::NetworkError;
 use crate::pgdatadir_mapping::{DatadirTimeline, LsnForTimestamp};
 use crate::profiling::profpoint_start;
 use crate::reltag::RelTag;
@@ -311,18 +311,22 @@ fn page_service_conn_main(
     let mut conn_handler = PageServerHandler::new(conf, auth);
     let pgbackend =
         PostgresBackend::new(socket, auth_type, None, true).map_err(anyhow::Error::from)?;
-    pgbackend.run(&mut conn_handler).map_err(|err| {
-        let root_cause_io_err_kind = err
-            .root_cause()
-            .downcast_ref::<io::Error>()
-            .map(|e| e.kind());
+    pgbackend
+        .run(&mut conn_handler)
+        .map_err(|err| {
+            let root_cause_io_err_kind = err
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .map(|e| e.kind());
 
-        if let Some(io::ErrorKind::ConnectionReset) = root_cause_io_err_kind {
-            error::PageServerError::PostgresIO(PostgresIOError::ConnectionReset)
-        } else {
-            error::PageServerError::Internal(err)
-        }
-    })?;
+            if let Some(io::ErrorKind::ConnectionReset) = root_cause_io_err_kind {
+                // `ConnectionReset` error happens when the Postgres client closes the connection, which is expected.
+                error::PageServerError::Network(NetworkError::ConnectionReset)
+            } else {
+                error::PageServerError::Internal(err)
+            }
+        })
+        .context("failed to run the Postgres backend")?;
     Ok(())
 }
 

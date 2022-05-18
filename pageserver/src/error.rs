@@ -8,15 +8,15 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 /// The general error type when running the page server.
 pub enum PageServerError {
-    #[error("Postgres IO error: {0:#}")]
-    PostgresIO(#[from] PostgresIOError),
+    #[error("Network error: {0:#}")]
+    Network(#[from] NetworkError),
     #[error("Internal error: {0:?}")]
     Internal(#[from] anyhow::Error),
 }
 
 #[derive(Debug, Error)]
 /// The error type for I/O operations with the Postgres client.
-pub enum PostgresIOError {
+pub enum NetworkError {
     #[error("Connection reset by peer")]
     ConnectionReset,
 }
