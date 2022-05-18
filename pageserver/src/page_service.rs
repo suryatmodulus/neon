@@ -311,23 +311,19 @@ fn page_service_conn_main(
     let mut conn_handler = PageServerHandler::new(conf, auth);
     let pgbackend =
         PostgresBackend::new(socket, auth_type, None, true).map_err(anyhow::Error::from)?;
-    pgbackend
-        .run(&mut conn_handler)
-        .map_err(|err| {
-            let root_cause_io_err_kind = err
-                .root_cause()
-                .downcast_ref::<io::Error>()
-                .map(|e| e.kind());
+    pgbackend.run(&mut conn_handler).map_err(|err| {
+        let root_cause_io_err_kind = err
+            .root_cause()
+            .downcast_ref::<io::Error>()
+            .map(|e| e.kind());
 
-            if let Some(io::ErrorKind::ConnectionReset) = root_cause_io_err_kind {
-                // `ConnectionReset` error happens when the Postgres client closes the connection, which is expected.
-                error::PageServerError::Network(NetworkError::ConnectionReset)
-            } else {
-                error::PageServerError::Internal(err)
-            }
-        })
-        .context("failed to run the Postgres backend")?;
-    Ok(())
+        if let Some(io::ErrorKind::ConnectionReset) = root_cause_io_err_kind {
+            // `ConnectionReset` error happens when the Postgres client closes the connection, which is expected.
+            error::PageServerError::Network(NetworkError::ConnectionReset)
+        } else {
+            error::PageServerError::Internal(err)
+        }
+    })
 }
 
 #[derive(Debug)]
