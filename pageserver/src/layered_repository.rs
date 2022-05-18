@@ -1851,22 +1851,8 @@ impl LayeredTimeline {
             let mut layer_paths_to_upload = HashSet::with_capacity(partitioning.parts.len());
             for part in partitioning.parts.iter() {
                 if self.time_for_new_image_layer(part, lsn)? {
-                    let new_path = self.create_image_layer(part, lsn);
-                    if let Err(error) = &new_path {
-                        if let Some(io_error) = error.root_cause().downcast_ref::<std::io::Error>()
-                        {
-                            if io_error.kind() == std::io::ErrorKind::AlreadyExists {
-                                info!(
-                                    "Image layer already exists for partition {}..{} at {}",
-                                    part.ranges.first().unwrap().start,
-                                    part.ranges.last().unwrap().end,
-                                    lsn
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    layer_paths_to_upload.insert(new_path?);
+                    let new_path = self.create_image_layer(part, lsn)?;
+                    layer_paths_to_upload.insert(new_path);
                 }
             }
             if self.upload_layers.load(atomic::Ordering::Relaxed) {
@@ -1902,15 +1888,16 @@ impl LayeredTimeline {
                 } else {
                     Lsn(0)
                 };
+                if img_lsn < lsn {
+                    let num_deltas = layers.count_deltas(&img_range, &(img_lsn..lsn))?;
 
-                let num_deltas = layers.count_deltas(&img_range, &(img_lsn..lsn))?;
-
-                debug!(
-                    "range {}-{}, has {} deltas on this timeline",
-                    img_range.start, img_range.end, num_deltas
-                );
-                if num_deltas >= self.get_image_creation_threshold() {
-                    return Ok(true);
+                    debug!(
+                        "key range {}-{}, has {} deltas on this timeline in LSN range {}..{}",
+                        img_range.start, img_range.end, num_deltas, img_lsn, lsn
+                    );
+                    if num_deltas >= self.get_image_creation_threshold() {
+                        return Ok(true);
+                    }
                 }
             }
         }
