@@ -1230,7 +1230,7 @@ impl LayeredTimeline {
             }),
             disk_consistent_lsn: AtomicLsn::new(metadata.disk_consistent_lsn().0),
 
-            last_freeze_at: AtomicLsn::new(0),
+            last_freeze_at: AtomicLsn::new(metadata.disk_consistent_lsn().0),
 
             ancestor_timeline: ancestor,
             ancestor_lsn: metadata.ancestor_lsn(),
@@ -1692,7 +1692,6 @@ impl LayeredTimeline {
     fn flush_frozen_layer(&self, frozen_layer: Arc<InMemoryLayer>) -> Result<()> {
         let new_delta = frozen_layer.write_to_disk()?;
         let new_delta_path = new_delta.path();
-
         // Sync the new layer to disk.
         //
         // We must also fsync the timeline dir to ensure the directory entries for
