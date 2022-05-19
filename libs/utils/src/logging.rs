@@ -14,7 +14,7 @@ pub fn init(log_filename: impl AsRef<Path>, daemonize: bool) -> Result<File> {
         .open(&log_filename)
         .with_context(|| format!("failed to open {:?}", log_filename.as_ref()))?;
 
-    let default_filter_str = "trace";
+    let default_filter_str = "info";
 
     // We fall back to printing all spans at info-level or above if
     // the RUST_LOG environment variable is not set.
