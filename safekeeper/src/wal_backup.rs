@@ -1,22 +1,23 @@
 use anyhow::{bail, ensure, Context, Result};
 
+use std::cmp::min;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use postgres_ffi::xlog_utils::{XLogFileName, XLogSegNo, XLogSegNoOffsetToRecPtr, PG_TLI};
-use remote_storage::{GenericRemoteStorage, RemoteStorage, RemoteStorageConfig};
+use remote_storage::{GenericRemoteStorage, RemoteStorage};
 use tokio::fs::File;
 use tokio::runtime::{Builder, Runtime};
 
-use tokio::spawn;
-use tokio::sync::watch::{Receiver, Sender};
-use tokio::task::JoinHandle;
+use tokio::select;
+use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::time::sleep;
 use tracing::*;
 
 use utils::{lsn::Lsn, zid::ZTenantTimelineId};
 
-use crate::{broker, wal_storage, SafeKeeperConf};
+use crate::broker::Election;
+use crate::{broker, SafeKeeperConf};
 
 use once_cell::sync::OnceCell;
 
@@ -26,17 +27,22 @@ const DEFAULT_BACKUP_RUNTIME_SIZE: u32 = 16;
 const MIN_WAL_SEGMENT_SIZE: usize = 1 << 20; // 1MB
 const MAX_WAL_SEGMENT_SIZE: usize = 1 << 30; // 1GB
 
-const BACKUP_ELECTION_PATH: &str = "WAL_BACKUP";
+const BACKUP_ELECTION_NAME: &str = "WAL_BACKUP";
 
-const LEASE_ACQUISITION_RETRY_DELAY_MS: u64 = 1000;
+const BROKER_CONNECTION_RETRY_DELAY_MS: u64 = 1000;
+
+const UPLOAD_FAILURE_RETRY_MIN_MS: u64 = 10;
+const UPLOAD_FAILURE_RETRY_MAX_MS: u64 = 5000;
 
 async fn backup_task(
-    conf: SafeKeeperConf,
-    timeline_id: ZTenantTimelineId,
     backup_start: Lsn,
+    timeline_id: ZTenantTimelineId,
+    timeline_dir: PathBuf,
     mut segment_size_set: Receiver<u32>,
     mut lsn_durable: Receiver<Lsn>,
+    mut shutdown: Receiver<bool>,
     lsn_backed_up: Sender<Lsn>,
+    election: Election,
 ) -> Result<()> {
     info!("Starting backup task, backup_lsn {}", backup_start);
 
@@ -52,48 +58,64 @@ async fn backup_task(
 
     let mut backup_lsn = backup_start;
 
-    // let mut lease: Option<i64> = None;
-
     loop {
-        let mut keepalive = None::<JoinHandle<Result<()>>>;
+        let mut leader = None;
+        let mut retry_attempt = 0u64;
+
+        select! {
+            result = broker::get_leader(&election) => {
+                match result {
+                    Ok(l) => { leader = Some(l);},
+                    Err(e) => {
+                        error!("Error during leader election {:?}", e);
+                        sleep(Duration::from_millis(BROKER_CONNECTION_RETRY_DELAY_MS)).await;
+                        continue;
+                    },
+                }
+            }
+            _ = shutdown.changed() => {}
+        }
+
         let mut cancel = false;
 
-        let c = conf.clone();
-
-        let lease =
-        if c.broker_endpoints.is_some() {
-            let lease_id = match broker::get_lease(&c).await {
-                Ok(l) => l,
-                Err(e) => {
-                    error!("Could not acqire lease {}", e);
-                    sleep(Duration::from_millis(LEASE_ACQUISITION_RETRY_DELAY_MS)).await;
-                    continue;
-                }
-            };
-
-            let ka = spawn::<_>(broker::lease_keep_alive(lease_id, c.clone()));
-
-            if let Err(e) = broker::become_leader(
-                lease_id,
-                BACKUP_ELECTION_PATH.to_string(),
-                &timeline_id,
-                &conf,
-            )
-            .await
-            {
-                warn!("Error during candidate election, restarting. details: {:?}", e);
-
-                ka.abort();
-                continue;
+        if *shutdown.borrow() {
+            if let Some(l) = leader {
+                l.give_up()
+                    .await
+                    .context("failed to drop election on shutdown")?;
             }
 
-            keepalive = Some(ka);
-            Some(lease_id)
-        } else { None };
+            break;
+        }
+
+        // TODO: antons - replace with backup start LSN discovery after leadership acquisition
+        // backup_lsn = backup_start;
 
         loop {
-            if let Err(e) = lsn_durable.changed().await {
-                warn!("Channel closed shutting down wal backup {:?}", e);
+            // If no changes to LSN we should retry failed upload anyway; No jitter for simplicity, this should be in S3 library anyway
+            let retry_delay = if retry_attempt > 0 {
+                min(
+                    UPLOAD_FAILURE_RETRY_MIN_MS << retry_attempt,
+                    UPLOAD_FAILURE_RETRY_MAX_MS,
+                )
+            } else {
+                u64::MAX
+            };
+
+            select! {
+                durable_changed  = lsn_durable.changed() => {
+                    if let Err(e) = durable_changed {
+                        error!("Channel closed shutting down wal backup {:?}", e);
+                        cancel = true;
+                        break;
+                    }
+                }
+                _ = shutdown.changed() => {}
+                _ = sleep(Duration::from_millis(retry_delay)) => {}
+            }
+
+            if *shutdown.borrow() {
+                info!("Shutting down wal backup");
                 cancel = true;
                 break;
             }
@@ -105,32 +127,25 @@ async fn backup_task(
                 "backup lsn should never pass commit lsn"
             );
 
-            if backup_lsn.segment_number(wal_seg_size)
-                == commit_lsn.segment_number(wal_seg_size)
-            {
+            if backup_lsn.segment_number(wal_seg_size) == commit_lsn.segment_number(wal_seg_size) {
                 continue;
             }
 
-            if lease.is_some() {
+            if let Some(l) = leader {
                 // Optimization idea for later:
                 //  Avoid checking election leader every time by returning current lease grant expiration time
                 //  Re-check leadership only after expiration time,
                 //  such approach woud reduce overhead on write-intensive workloads
 
-                match broker::is_leader(BACKUP_ELECTION_PATH.to_string(), &timeline_id, &conf)
-                    .await
-                {
-                    Ok(is_leader) => {
-                        if !is_leader {
-                            info!("Leader has changed for for the timeline {}", timeline_id);
+                match l.check_am_i(election.election_name.clone(), election.candidate_name.clone()).await {
+                    Ok(leader) => {
+                        if !leader {
+                            info!("Leader has changed");
                             break;
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "Error validating leader for the timeline {}, {:?}",
-                            timeline_id, e
-                        );
+                        warn!("Error validating leader, {:?}", e);
                         break;
                     }
                 }
@@ -141,24 +156,35 @@ async fn backup_task(
                 commit_lsn, backup_lsn
             );
 
-            match backup_lsn_range(backup_lsn, commit_lsn, wal_seg_size, &conf, timeline_id)
-                .await
+            match backup_lsn_range(
+                backup_lsn,
+                commit_lsn,
+                wal_seg_size,
+                timeline_id,
+                timeline_dir.clone(),
+            )
+            .await
             {
                 Ok(backup_lsn_result) => {
                     backup_lsn = backup_lsn_result;
                     lsn_backed_up.send(backup_lsn)?;
+                    retry_attempt = 0;
                 }
                 Err(e) => {
                     error!(
                         "Failure in backup backup commit_lsn {} backup lsn {}, {:?}",
                         commit_lsn, backup_lsn, e
                     );
+
+                    retry_attempt += 1;
                 }
             }
         }
 
-        if let Some(ka) = keepalive {
-            ka.abort();
+        if let Some(l) = leader {
+            l.give_up()
+                .await
+                .context("failed to resign from election")?;
         }
 
         if cancel {
@@ -173,12 +199,12 @@ pub async fn backup_lsn_range(
     start_lsn: Lsn,
     end_lsn: Lsn,
     wal_seg_size: usize,
-    conf: &SafeKeeperConf,
     timeline_id: ZTenantTimelineId,
+    timeline_dir: PathBuf,
 ) -> Result<Lsn> {
     let mut res = start_lsn;
     for s in get_segments(start_lsn, end_lsn, wal_seg_size) {
-        let seg_backup = backup_single_segment(s, wal_seg_size, conf, timeline_id).await;
+        let seg_backup = backup_single_segment(s, timeline_id, timeline_dir.clone()).await;
 
         // TODO: antons limit this only to Not Found errors
         if seg_backup.is_err() && start_lsn.is_valid() {
@@ -202,53 +228,91 @@ pub async fn backup_lsn_range(
 
 async fn backup_single_segment(
     seg: Segment,
-    wal_seg_size: usize,
-    conf: &SafeKeeperConf,
     timeline_id: ZTenantTimelineId,
+    timeline_dir: PathBuf,
 ) -> Result<()> {
-    let segment_file_name = seg.file_path(&timeline_id, conf)?;
+    let segment_file_name = seg.file_path(timeline_dir.as_path())?;
     let dest_name = PathBuf::from(format!(
         "{}/{}",
         timeline_id.tenant_id, timeline_id.timeline_id
     ))
-    .with_file_name(seg.file_name());
+    .with_file_name(seg.object_name());
 
     debug!("Backup of {} requested", segment_file_name.display());
-    ensure!(seg.size() == wal_seg_size);
 
     if !segment_file_name.exists() {
         // TODO: antons return a specific error
         bail!("Segment file is Missing");
     }
 
-    backup_object(
-        conf.backup_storage.as_ref(),
-        conf.timeline_dir(&timeline_id),
-        &segment_file_name,
-        seg.size(),
-        &dest_name,
-    )
-    .await?;
+    // TODO: antons implement retry logic
+    backup_object(&segment_file_name, seg.size(), &dest_name).await?;
     debug!("Backup of {} done", segment_file_name.display());
 
     Ok(())
 }
 
+pub struct WalBackup {
+    wal_segment_size: Sender<u32>,
+    lsn_committed: Sender<Lsn>,
+    lsn_backed_up: Receiver<Lsn>,
+    shutdown: Sender<bool>,
+}
+
+impl WalBackup {
+    pub fn new(
+        wal_segment_size: Sender<u32>,
+        lsn_committed: Sender<Lsn>,
+        lsn_backed_up: Receiver<Lsn>,
+        shutdown: Sender<bool>,
+    ) -> Self {
+        Self {
+            wal_segment_size,
+            lsn_committed,
+            lsn_backed_up,
+            shutdown,
+        }
+    }
+
+    pub fn set_wal_seg_size(&self, wal_seg_size: u32) -> Result<()> {
+        self.wal_segment_size
+            .send(wal_seg_size)
+            .context("Failed to notify wal backup regarding wal segment size")?;
+        Ok(())
+    }
+
+    pub fn notify_lsn_committed(&self, lsn: Lsn) -> Result<()> {
+        self.lsn_committed
+            .send(lsn)
+            .context("Failed to notify wal backup regarding committed lsn")?;
+        Ok(())
+    }
+
+    pub fn shutdown(&self) -> Result<()> {
+        self.shutdown
+            .send(true)
+            .context("Failed to send shutdown signal to wal backup task")?;
+        // TODO: antons we may need to await the task here
+        Ok(())
+    }
+
+    pub fn get_backup_lsn(&self) -> Lsn {
+        *self.lsn_backed_up.borrow()
+    }
+}
+
 pub fn create(
     conf: &SafeKeeperConf,
     timeline_id: &ZTenantTimelineId,
-    initial_lsn: Lsn,
-    wal_seg_size: Receiver<u32>,
-    lsn_committed: Receiver<Lsn>,
-    lsn_backed_up: Sender<Lsn>,
-) -> Result<()> {
-    let runtime = BACKUP_RUNTIME.get_or_init(|| {
-        let rt_size = usize::try_from(
-            conf.backup_runtime_threads
-                .unwrap_or(DEFAULT_BACKUP_RUNTIME_SIZE),
-        )
-        .expect("Could not get configuration value for backup_runtime_threads");
+    backup_start: Lsn,
+) -> Result<WalBackup> {
+    let rt_size = usize::try_from(
+        conf.backup_runtime_threads
+            .unwrap_or(DEFAULT_BACKUP_RUNTIME_SIZE),
+    )
+    .expect("Could not get configuration value for backup_runtime_threads");
 
+    let runtime = BACKUP_RUNTIME.get_or_init(|| {
         info!("Initializing backup async runtime with {} threads", rt_size);
 
         Builder::new_multi_thread()
@@ -258,19 +322,66 @@ pub fn create(
             .expect("Failed to create wal backup runtime")
     });
 
+    let (lsn_committed_sender, lsn_committed_receiver) = watch::channel(Lsn::INVALID);
+    let (lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
+    let (wal_seg_size_sender, wal_seg_size_receiver) = watch::channel::<u32>(0);
+    let (shutdown_sender, shutdown_receiver) = watch::channel::<bool>(false);
+
+    let _ = REMOTE_STORAGE.get_or_init(|| {
+        let rs = conf.backup_storage.as_ref().map(|c| {
+            GenericRemoteStorage::new(conf.timeline_dir(timeline_id), c)
+                .expect("Failed to create remote storage")
+        });
+
+        Box::new(rs)
+    });
+
+    let election_name = broker::get_campaign_name(
+        BACKUP_ELECTION_NAME.to_string(),
+        conf.broker_etcd_prefix,
+        &timeline_id,
+    );
+    let my_candidate_name = broker::get_candiate_name(conf.my_id);
+    let election = broker::Election::new(
+        election_name,
+        my_candidate_name,
+        conf.broker_endpoints.clone(),
+    );
+
     runtime.spawn(
         backup_task(
-            conf.clone(),
+            backup_start,
             *timeline_id,
-            initial_lsn,
-            wal_seg_size,
-            lsn_committed,
-            lsn_backed_up,
+            conf.timeline_dir(timeline_id),
+            wal_seg_size_receiver,
+            lsn_committed_receiver,
+            shutdown_receiver,
+            lsn_backed_up_sender,
+            election,
         )
         .instrument(info_span!("Wal Backup", timeline_id.timeline_id = %timeline_id)),
     );
 
-    Ok(())
+    Ok(WalBackup::new(
+        wal_seg_size_sender,
+        lsn_committed_sender,
+        lsn_backed_up_receiver,
+        shutdown_sender,
+    ))
+}
+
+pub fn create_noop() -> WalBackup {
+    let (lsn_committed_sender, _lsn_committed_receiver) = watch::channel(Lsn::INVALID);
+    let (_lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
+    let (wal_seg_size_sender, _wal_seg_size_receiver) = watch::channel::<u32>(0);
+    let (shutdown_sender, shutdown_receiver) = watch::channel::<bool>(false);
+
+    WalBackup::new(
+        wal_seg_size_sender,
+        lsn_committed_sender,
+        lsn_backed_up_receiver,
+        shutdown_sender,
+    )
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -289,18 +400,12 @@ impl Segment {
         }
     }
 
-    pub fn file_name(self) -> String {
+    pub fn object_name(self) -> String {
         XLogFileName(PG_TLI, self.seg_no, self.size())
     }
 
-    pub fn file_path(
-        self,
-        timeline_id: &ZTenantTimelineId,
-        conf: &SafeKeeperConf,
-    ) -> Result<PathBuf> {
-        let (wal_file_path, _wal_file_partial_path) =
-            wal_storage::wal_file_paths(&conf.timeline_dir(timeline_id), self.seg_no, self.size())?;
-        Ok(wal_file_path)
+    pub fn file_path(self, timeline_dir: &Path) -> Result<PathBuf> {
+        Ok(timeline_dir.join(self.object_name()))
     }
 
     pub fn size(self) -> usize {
@@ -323,23 +428,10 @@ fn get_segments(start: Lsn, end: Lsn, seg_size: usize) -> Vec<Segment> {
     res
 }
 
-// Ugly stuff, probably needs a new home
 static REMOTE_STORAGE: OnceCell<Box<Option<GenericRemoteStorage>>> = OnceCell::new();
 
-async fn backup_object(
-    backup_storage_config: Option<&RemoteStorageConfig>,
-    source_directory: PathBuf,
-    source_file: &PathBuf,
-    size: usize,
-    destination: &Path,
-) -> Result<()> {
-    let storage = REMOTE_STORAGE.get_or_init(|| {
-        let rs = backup_storage_config.map(|c| {
-            GenericRemoteStorage::new(source_directory, c).expect("Failed to create remote storage")
-        });
-
-        Box::new(rs)
-    });
+async fn backup_object(source_file: &PathBuf, size: usize, destination: &Path) -> Result<()> {
+    let storage = REMOTE_STORAGE.get().expect("failed to get remote storage");
 
     let file = File::open(&source_file).await?;
 

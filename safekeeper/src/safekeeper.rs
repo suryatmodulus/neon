@@ -13,14 +13,13 @@ use std::cmp::max;
 use std::cmp::min;
 use std::fmt;
 use std::io::Read;
-use tokio::sync::watch::Receiver;
-use tokio::sync::watch::Sender;
 use tracing::*;
 
 use lazy_static::lazy_static;
 
 use crate::control_file;
 use crate::send_wal::HotStandbyFeedback;
+use crate::wal_backup::WalBackup;
 use crate::wal_storage;
 use metrics::{register_gauge_vec, Gauge, GaugeVec};
 use postgres_ffi::xlog_utils::MAX_SEND_SIZE;
@@ -533,9 +532,7 @@ pub struct SafeKeeper<CTRL: control_file::Storage, WAL: wal_storage::Storage> {
     pub wal_store: WAL,
 
     node_id: ZNodeId, // safekeeper's node id
-    lsn_committed: Sender<Lsn>,
-    lsn_backed_up: Receiver<Lsn>,
-    wal_segment_size: Sender<u32>,
+    wal_backup: WalBackup,
 }
 
 impl<CTRL, WAL> SafeKeeper<CTRL, WAL>
@@ -549,9 +546,7 @@ where
         state: CTRL,
         mut wal_store: WAL,
         node_id: ZNodeId,
-        lsn_committed: Sender<Lsn>,
-        lsn_backed_up: Receiver<Lsn>,
-        wal_segment_size: Sender<u32>,
+        wal_backup: WalBackup,
     ) -> Result<SafeKeeper<CTRL, WAL>> {
         if state.timeline_id != ZTimelineId::from([0u8; 16]) && ztli != state.timeline_id {
             bail!("Calling SafeKeeper::new with inconsistent ztli ({}) and SafeKeeperState.server.timeline_id ({})", ztli, state.timeline_id);
@@ -574,9 +569,7 @@ where
             state,
             wal_store,
             node_id,
-            lsn_committed,
-            lsn_backed_up,
-            wal_segment_size,
+            wal_backup,
         })
     }
 
@@ -659,9 +652,8 @@ where
             self.state.persist(&state)?;
         }
 
-        self.wal_segment_size
-            .send(self.state.server.wal_seg_size)
-            .context("Failed to notify wal segment size")?;
+        self.wal_backup
+            .set_wal_seg_size(self.state.server.wal_seg_size)?;
         self.wal_store.init_storage(&self.state)?;
 
         info!(
@@ -768,18 +760,14 @@ where
         Ok(None)
     }
 
-    fn notify_commit_lsn_watchers(&self, commit_lsn: Lsn) -> Result<()> {
-        self.lsn_committed.send(commit_lsn).ok();
-        Ok(())
-    }
-
     /// Advance commit_lsn taking into account what we have locally
     pub fn update_commit_lsn(&mut self) -> Result<()> {
         let commit_lsn = min(self.global_commit_lsn, self.wal_store.flush_lsn());
         assert!(commit_lsn >= self.inmem.commit_lsn);
 
         self.inmem.commit_lsn = commit_lsn;
-        self.notify_commit_lsn_watchers(commit_lsn).ok();
+        // TODO: antons error handling here
+        self.wal_backup.notify_lsn_committed(commit_lsn)?;
         self.metrics.commit_lsn.set(self.inmem.commit_lsn.0 as f64);
 
         // If new commit_lsn reached epoch switch, force sync of control
@@ -807,7 +795,7 @@ where
     fn persist_control_file(&mut self) -> Result<()> {
         let mut state = self.state.clone();
         state.commit_lsn = self.inmem.commit_lsn;
-        state.backup_lsn = *self.lsn_backed_up.borrow();
+        state.backup_lsn = self.wal_backup.get_backup_lsn();
         state.peer_horizon_lsn = self.inmem.peer_horizon_lsn;
         state.remote_consistent_lsn = self.inmem.remote_consistent_lsn;
         state.proposer_uuid = self.inmem.proposer_uuid;
@@ -966,12 +954,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Deref;
-
-    use tokio::sync::watch;
-
     use super::*;
-    use crate::wal_storage::Storage;
+    use crate::{wal_backup, wal_storage::Storage};
+    use std::ops::Deref;
 
     // fake storage for tests
     struct InMemoryState {
@@ -1033,18 +1018,12 @@ mod tests {
         let wal_store = DummyWalStore { lsn: Lsn(0) };
         let ztli = ZTimelineId::from([0u8; 16]);
 
-        let (lsn_committed_sender, _lsn_committed_receiver) = watch::channel(Lsn::INVALID);
-        let (_lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
-        let (seg_size_sender, _seg_size_receiver) = watch::channel::<u32>(0);
-
         let mut sk = SafeKeeper::new(
             ztli,
             storage,
             wal_store,
             ZNodeId(0),
-            lsn_committed_sender,
-            lsn_backed_up_receiver,
-            seg_size_sender,
+            wal_backup::create_noop(),
         )
         .unwrap();
 
@@ -1061,18 +1040,13 @@ mod tests {
         let storage = InMemoryState {
             persisted_state: state,
         };
-        let (lsn_committed_sender, _lsn_committed_receiver) = watch::channel(Lsn::INVALID);
-        let (_lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
-        let (seg_size_sender, _seg_size_receiver) = watch::channel::<u32>(0);
 
         sk = SafeKeeper::new(
             ztli,
             storage,
             sk.wal_store,
             ZNodeId(0),
-            lsn_committed_sender,
-            lsn_backed_up_receiver,
-            seg_size_sender,
+            wal_backup::create_noop(),
         )
         .unwrap();
 
@@ -1092,18 +1066,12 @@ mod tests {
         let wal_store = DummyWalStore { lsn: Lsn(0) };
         let ztli = ZTimelineId::from([0u8; 16]);
 
-        let (lsn_committed_sender, _lsn_committed_receiver) = watch::channel(Lsn(0));
-        let (_lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn(0));
-        let (seg_size_sender, _seg_size_receiver) = watch::channel::<u32>(0);
-
         let mut sk = SafeKeeper::new(
             ztli,
             storage,
             wal_store,
             ZNodeId(0),
-            lsn_committed_sender,
-            lsn_backed_up_receiver,
-            seg_size_sender,
+            wal_backup::create_noop(),
         )
         .unwrap();
 

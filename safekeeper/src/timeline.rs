@@ -6,7 +6,6 @@ use anyhow::{bail, Context, Result};
 use etcd_broker::SkTimelineInfo;
 use lazy_static::lazy_static;
 use postgres_ffi::xlog_utils::XLogSegNo;
-use tokio::sync::watch;
 
 use serde::Serialize;
 
@@ -106,28 +105,8 @@ impl SharedState {
         let control_store = control_file::FileStorage::create_new(zttid, conf, state)?;
 
         let wal_store = wal_storage::PhysicalStorage::new(zttid, conf);
-
-        let (lsn_committed_sender, lsn_committed_receiver) = watch::channel(Lsn::INVALID);
-        let (lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
-        let (wal_seg_size_sender, wal_seg_size_receiver) = watch::channel::<u32>(0);
-
-        wal_backup::create(
-            conf,
-            zttid,
-            control_store.backup_lsn,
-            wal_seg_size_receiver,
-            lsn_committed_receiver,
-            lsn_backed_up_sender,
-        )?;
-        let sk = SafeKeeper::new(
-            zttid.timeline_id,
-            control_store,
-            wal_store,
-            conf.my_id,
-            lsn_committed_sender,
-            lsn_backed_up_receiver,
-            wal_seg_size_sender,
-        )?;
+        let wb = wal_backup::create(conf, zttid, control_store.backup_lsn)?;
+        let sk = SafeKeeper::new(zttid.timeline_id, control_store, wal_store, conf.my_id, wb)?;
 
         Ok(Self {
             notified_commit_lsn: Lsn(0),
@@ -148,30 +127,11 @@ impl SharedState {
 
         info!("timeline {} restored", zttid.timeline_id);
 
-        let (lsn_committed_sender, lsn_committed_receiver) = watch::channel(Lsn::INVALID);
-        let (lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
-        let (wal_seg_size_sender, wal_seg_size_receiver) = watch::channel::<u32>(0);
-
-        wal_backup::create(
-            conf,
-            zttid,
-            control_store.backup_lsn,
-            wal_seg_size_receiver,
-            lsn_committed_receiver,
-            lsn_backed_up_sender,
-        )?;
+        let wb = wal_backup::create(conf, zttid, control_store.backup_lsn)?;
 
         Ok(Self {
             notified_commit_lsn: Lsn(0),
-            sk: SafeKeeper::new(
-                zttid.timeline_id,
-                control_store,
-                wal_store,
-                conf.my_id,
-                lsn_committed_sender,
-                lsn_backed_up_receiver,
-                wal_seg_size_sender,
-            )?,
+            sk: SafeKeeper::new(zttid.timeline_id, control_store, wal_store, conf.my_id, wb)?,
             replicas: Vec::new(),
             active: false,
             num_computes: 0,
