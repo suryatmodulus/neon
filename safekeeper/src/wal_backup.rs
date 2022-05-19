@@ -34,6 +34,7 @@ const BROKER_CONNECTION_RETRY_DELAY_MS: u64 = 1000;
 const UPLOAD_FAILURE_RETRY_MIN_MS: u64 = 10;
 const UPLOAD_FAILURE_RETRY_MAX_MS: u64 = 5000;
 
+#[allow(clippy::too_many_arguments)]
 async fn backup_task(
     backup_start: Lsn,
     timeline_id: ZTenantTimelineId,
@@ -79,7 +80,7 @@ async fn backup_task(
         let mut cancel = false;
 
         if *shutdown.borrow() {
-            if let Some(l) = leader {
+            if let Some(l) = leader.as_ref() {
                 l.give_up()
                     .await
                     .context("failed to drop election on shutdown")?;
@@ -131,7 +132,7 @@ async fn backup_task(
                 continue;
             }
 
-            if let Some(l) = leader {
+            if let Some(l) = leader.as_ref() {
                 // Optimization idea for later:
                 //  Avoid checking election leader every time by returning current lease grant expiration time
                 //  Re-check leadership only after expiration time,
@@ -338,8 +339,8 @@ pub fn create(
 
     let election_name = broker::get_campaign_name(
         BACKUP_ELECTION_NAME.to_string(),
-        conf.broker_etcd_prefix,
-        &timeline_id,
+        conf.broker_etcd_prefix.clone(),
+        timeline_id,
     );
     let my_candidate_name = broker::get_candiate_name(conf.my_id);
     let election = broker::Election::new(
@@ -374,7 +375,7 @@ pub fn create_noop() -> WalBackup {
     let (lsn_committed_sender, _lsn_committed_receiver) = watch::channel(Lsn::INVALID);
     let (_lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
     let (wal_seg_size_sender, _wal_seg_size_receiver) = watch::channel::<u32>(0);
-    let (shutdown_sender, shutdown_receiver) = watch::channel::<bool>(false);
+    let (shutdown_sender, _shutdown_receiver) = watch::channel::<bool>(false);
 
     WalBackup::new(
         wal_seg_size_sender,

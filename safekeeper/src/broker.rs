@@ -69,11 +69,12 @@ pub struct ElectionLeader {
 
 impl ElectionLeader {
     pub async fn check_am_i(
-        mut self,
+        &self,
         election_name: String,
         candidate_name: String,
     ) -> Result<bool> {
-        let resp = self.client.leader(election_name).await?;
+        let mut c = self.client.clone();
+        let resp = c.leader(election_name).await?;
 
         let kv = resp.kv().expect("failed to get leader response");
         let leader = kv.value_str().expect("failed to get campaign leader value");
