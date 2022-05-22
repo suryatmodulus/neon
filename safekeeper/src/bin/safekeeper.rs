@@ -12,14 +12,18 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use tokio::sync::mpsc;
+use toml_edit::Document;
 use tracing::*;
 use url::{ParseError, Url};
 
 use safekeeper::control_file::{self};
-use safekeeper::defaults::{DEFAULT_HTTP_LISTEN_ADDR, DEFAULT_PG_LISTEN_ADDR};
+use safekeeper::defaults::{
+    DEFAULT_HTTP_LISTEN_ADDR, DEFAULT_PG_LISTEN_ADDR, DEFAULT_WAL_BACKUP_RUNTIME_THREADS,
+};
 use safekeeper::http;
 use safekeeper::remove_wal;
 use safekeeper::timeline::GlobalTimelines;
+use safekeeper::wal_backup;
 use safekeeper::wal_service;
 use safekeeper::SafeKeeperConf;
 use safekeeper::{broker, callmemaybe};
@@ -112,9 +116,12 @@ fn main() -> anyhow::Result<()> {
             .takes_value(true)
             .help("a comma separated broker (etcd) endpoints for storage nodes coordination, e.g. 'http://127.0.0.1:2379'"),
         ).arg(
-            Arg::new("backup-threads").long("backup-threads").takes_value(true).help("number of threads for wal backup: integer")
+            Arg::new("backup-threads").long("backup-threads").takes_value(true).help(formatcp!("number of threads for wal backup (default {DEFAULT_WAL_BACKUP_RUNTIME_THREADS}")),
         ).arg(
-            Arg::new("backup-storage").long("backup-storage").takes_value(true).help("backup storage configuration: e.g. {\"max_concurrent_syncs\": \"17\", \"max_sync_errors\": \"13\", \"bucket_name\": \"<BUCKETNAME>\", \"bucket_region\":\"<REGION>\", \"concurrency_limit\": \"119\"} ")
+            Arg::new("remote-storage")
+                .long("remote-storage")
+                .takes_value(true)
+                .help("backup storage configuration as TOML inline table, e.g. {\"max_concurrent_syncs\" = 17, \"max_sync_errors\": 13, \"bucket_name\": \"<BUCKETNAME>\", \"bucket_region\":\"<REGION>\", \"concurrency_limit\": 119} ")
         )
         .arg(
             Arg::new("broker-etcd-prefix")
@@ -176,17 +183,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(backup_threads) = arg_matches.value_of("backup-threads") {
-        conf.backup_runtime_threads = Some(
-            backup_threads
-                .parse()
-                .with_context(|| format!("Failed to parse backup threads {}", backup_threads))?,
-        );
+        conf.backup_runtime_threads = backup_threads
+            .parse()
+            .with_context(|| format!("Failed to parse backup threads {}", backup_threads))?;
     }
 
-    if let Some(storage_conf) = arg_matches.value_of("backup-storage") {
-        conf.backup_storage = Some(RemoteStorageConfig::from_json_string(
-            storage_conf.to_string(),
-        )?);
+    // TODO: unite with pageserver parsing
+    if let Some(storage_conf) = arg_matches.value_of("remote-storage") {
+        // funny toml doesn't consider plain inline table as valid document, so wrap in a key to parse
+        let storage_conf_toml = format!("remote_storage = {}", storage_conf);
+        let parsed_toml = storage_conf_toml.parse::<Document>()?; // parse
+        let (_, storage_conf_parsed_toml) = parsed_toml.iter().next().unwrap(); // and strip key off again
+        conf.remote_storage = Some(RemoteStorageConfig::from_toml(storage_conf_parsed_toml)?);
     }
 
     start_safekeeper(conf, given_id, arg_matches.is_present("init"))
@@ -252,7 +260,8 @@ fn start_safekeeper(mut conf: SafeKeeperConf, given_id: Option<ZNodeId>, init: b
     let signals = signals::install_shutdown_handlers()?;
     let mut threads = vec![];
     let (callmemaybe_tx, callmemaybe_rx) = mpsc::unbounded_channel();
-    GlobalTimelines::set_callmemaybe_tx(callmemaybe_tx);
+    let (wal_backup_launcher_tx, wal_backup_launcher_rx) = mpsc::channel(100);
+    GlobalTimelines::init(callmemaybe_tx, wal_backup_launcher_tx);
 
     let conf_ = conf.clone();
     threads.push(
@@ -316,6 +325,15 @@ fn start_safekeeper(mut conf: SafeKeeperConf, given_id: Option<ZNodeId>, init: b
             .name("WAL removal thread".into())
             .spawn(|| {
                 remove_wal::thread_main(conf_);
+            })?,
+    );
+
+    let conf_ = conf.clone();
+    threads.push(
+        thread::Builder::new()
+            .name("wal backup launcher thread".into())
+            .spawn(move || {
+                wal_backup::wal_backup_launcher_thread_main(conf_, wal_backup_launcher_rx);
             })?,
     );
 

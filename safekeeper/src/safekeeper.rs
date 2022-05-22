@@ -19,7 +19,7 @@ use lazy_static::lazy_static;
 
 use crate::control_file;
 use crate::send_wal::HotStandbyFeedback;
-use crate::wal_backup::WalBackup;
+
 use crate::wal_storage;
 use metrics::{register_gauge_vec, Gauge, GaugeVec};
 use postgres_ffi::xlog_utils::MAX_SEND_SIZE;
@@ -194,7 +194,8 @@ pub struct SafeKeeperState {
     /// Part of WAL acknowledged by quorum and available locally. Always points
     /// to record boundary.
     pub commit_lsn: Lsn,
-    /// LSN that points to the end of the last backed up segment
+    /// LSN that points to the end of the last backed up segment. Useful to
+    /// persist to avoid finding out offloading progress on boot.
     pub backup_lsn: Lsn,
     /// Minimal LSN which may be needed for recovery of some safekeeper (end_lsn
     /// of last record streamed to everyone). Persisting it helps skipping
@@ -532,7 +533,6 @@ pub struct SafeKeeper<CTRL: control_file::Storage, WAL: wal_storage::Storage> {
     pub wal_store: WAL,
 
     node_id: ZNodeId, // safekeeper's node id
-    wal_backup: WalBackup,
 }
 
 impl<CTRL, WAL> SafeKeeper<CTRL, WAL>
@@ -546,7 +546,6 @@ where
         state: CTRL,
         mut wal_store: WAL,
         node_id: ZNodeId,
-        wal_backup: WalBackup,
     ) -> Result<SafeKeeper<CTRL, WAL>> {
         if state.timeline_id != ZTimelineId::from([0u8; 16]) && ztli != state.timeline_id {
             bail!("Calling SafeKeeper::new with inconsistent ztli ({}) and SafeKeeperState.server.timeline_id ({})", ztli, state.timeline_id);
@@ -569,7 +568,6 @@ where
             state,
             wal_store,
             node_id,
-            wal_backup,
         })
     }
 
@@ -652,8 +650,6 @@ where
             self.state.persist(&state)?;
         }
 
-        self.wal_backup
-            .set_wal_seg_size(self.state.server.wal_seg_size)?;
         self.wal_store.init_storage(&self.state)?;
 
         info!(
@@ -766,9 +762,15 @@ where
         assert!(commit_lsn >= self.inmem.commit_lsn);
 
         self.inmem.commit_lsn = commit_lsn;
-        // TODO: antons error handling here
-        self.wal_backup.notify_lsn_committed(commit_lsn)?;
         self.metrics.commit_lsn.set(self.inmem.commit_lsn.0 as f64);
+
+        // We got our first commit_lsn, which means we should sync
+        // everything to disk, to initialize the state.
+        if self.state.commit_lsn == Lsn(0) && commit_lsn > Lsn(0) {
+            self.inmem.backup_lsn = self.inmem.commit_lsn; // initialize backup_lsn
+            self.wal_store.flush_wal()?;
+            self.persist_control_file()?;
+        }
 
         // If new commit_lsn reached epoch switch, force sync of control
         // file: walproposer in sync mode is very interested when this
@@ -781,13 +783,6 @@ where
             self.persist_control_file()?;
         }
 
-        // We got our first commit_lsn, which means we should sync
-        // everything to disk, to initialize the state.
-        if self.state.commit_lsn == Lsn(0) && commit_lsn > Lsn(0) {
-            self.wal_store.flush_wal()?;
-            self.persist_control_file()?;
-        }
-
         Ok(())
     }
 
@@ -795,7 +790,7 @@ where
     fn persist_control_file(&mut self) -> Result<()> {
         let mut state = self.state.clone();
         state.commit_lsn = self.inmem.commit_lsn;
-        state.backup_lsn = self.wal_backup.get_backup_lsn();
+        state.backup_lsn = self.inmem.backup_lsn;
         state.peer_horizon_lsn = self.inmem.peer_horizon_lsn;
         state.remote_consistent_lsn = self.inmem.remote_consistent_lsn;
         state.proposer_uuid = self.inmem.proposer_uuid;
@@ -955,7 +950,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{wal_backup, wal_storage::Storage};
+    use crate::wal_storage::Storage;
     use std::ops::Deref;
 
     // fake storage for tests
@@ -1018,14 +1013,7 @@ mod tests {
         let wal_store = DummyWalStore { lsn: Lsn(0) };
         let ztli = ZTimelineId::from([0u8; 16]);
 
-        let mut sk = SafeKeeper::new(
-            ztli,
-            storage,
-            wal_store,
-            ZNodeId(0),
-            wal_backup::create_noop(),
-        )
-        .unwrap();
+        let mut sk = SafeKeeper::new(ztli, storage, wal_store, ZNodeId(0)).unwrap();
 
         // check voting for 1 is ok
         let vote_request = ProposerAcceptorMessage::VoteRequest(VoteRequest { term: 1 });
@@ -1041,14 +1029,7 @@ mod tests {
             persisted_state: state,
         };
 
-        sk = SafeKeeper::new(
-            ztli,
-            storage,
-            sk.wal_store,
-            ZNodeId(0),
-            wal_backup::create_noop(),
-        )
-        .unwrap();
+        sk = SafeKeeper::new(ztli, storage, sk.wal_store, ZNodeId(0)).unwrap();
 
         // and ensure voting second time for 1 is not ok
         vote_resp = sk.process_msg(&vote_request);
@@ -1066,14 +1047,7 @@ mod tests {
         let wal_store = DummyWalStore { lsn: Lsn(0) };
         let ztli = ZTimelineId::from([0u8; 16]);
 
-        let mut sk = SafeKeeper::new(
-            ztli,
-            storage,
-            wal_store,
-            ZNodeId(0),
-            wal_backup::create_noop(),
-        )
-        .unwrap();
+        let mut sk = SafeKeeper::new(ztli, storage, wal_store, ZNodeId(0)).unwrap();
 
         let mut ar_hdr = AppendRequestHeader {
             term: 1,

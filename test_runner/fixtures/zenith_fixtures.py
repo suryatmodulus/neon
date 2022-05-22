@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import field
+from enum import Flag, auto
 import textwrap
 from cached_property import cached_property
 import asyncpg
@@ -422,6 +423,41 @@ class MockS3Server:
         self.subprocess.kill()
 
 
+@dataclass
+class LocalFsStorage:
+    local_path: Path
+
+
+@dataclass
+class S3Storage:
+    bucket_name: str
+    bucket_region: str
+    endpoint: Optional[str]
+
+
+RemoteStorage = Union[LocalFsStorage, S3Storage]
+
+
+# serialize as toml inline table
+def remote_storage_to_toml_inline_table(remote_storage):
+    if isinstance(remote_storage, LocalFsStorage):
+        res = f"local_path='{remote_storage.local_path}'"
+    elif isinstance(remote_storage, S3Storage):
+        res = f"bucket_name='{remote_storage.bucket_name}', bucket_region='{remote_storage.bucket_region}'"
+        if remote_storage.endpoint is not None:
+            res += f", endpoint='{remote_storage.endpoint}'"
+        else:
+            raise Exception(f'Unknown storage configuration {remote_storage}')
+    else:
+        raise Exception("invalid remote storage type")
+    return f"{{{res}}}"
+
+
+class RemoteStorageUsers(Flag):
+    PAGESERVER = auto()
+    SAFEKEEPER = auto()
+
+
 class ZenithEnvBuilder:
     """
     Builder object to create a Zenith runtime environment
@@ -437,6 +473,7 @@ class ZenithEnvBuilder:
                  broker: Etcd,
                  mock_s3_server: MockS3Server,
                  remote_storage: Optional[RemoteStorage] = None,
+                 remote_storage_users: RemoteStorageUsers = RemoteStorageUsers.PAGESERVER,
                  pageserver_config_override: Optional[str] = None,
                  num_safekeepers: int = 1,
                  pageserver_auth_enabled: bool = False,
@@ -446,6 +483,7 @@ class ZenithEnvBuilder:
         self.rust_log_override = rust_log_override
         self.port_distributor = port_distributor
         self.remote_storage = remote_storage
+        self.remote_storage_users = remote_storage_users
         self.broker = broker
         self.mock_s3_server = mock_s3_server
         self.pageserver_config_override = pageserver_config_override
@@ -494,9 +532,9 @@ class ZenithEnvBuilder:
             aws_access_key_id=self.mock_s3_server.access_key(),
             aws_secret_access_key=self.mock_s3_server.secret_key(),
         ).create_bucket(Bucket=bucket_name)
-        self.remote_storage = S3Storage(bucket=bucket_name,
+        self.remote_storage = S3Storage(bucket_name=bucket_name,
                                         endpoint=mock_endpoint,
-                                        region=mock_region)
+                                        bucket_region=mock_region)
 
     def __enter__(self):
         return self
@@ -554,6 +592,7 @@ class ZenithEnv:
         self.safekeepers: List[Safekeeper] = []
         self.broker = config.broker
         self.remote_storage = config.remote_storage
+        self.remote_storage_users = config.remote_storage_users
 
         # generate initial tenant ID here instead of letting 'zenith init' generate it,
         # so that we don't need to dig it out of the config file afterwards.
@@ -602,9 +641,12 @@ class ZenithEnv:
                 id = {id}
                 pg_port = {port.pg}
                 http_port = {port.http}
-                backup_threads = 7
-                sync = false # Disable fsyncs to make the tests go faster
-            """)
+                sync = false # Disable fsyncs to make the tests go faster""")
+            if bool(self.remote_storage_users
+                    & RemoteStorageUsers.SAFEKEEPER) and self.remote_storage is not None:
+                toml += textwrap.dedent(f"""
+                remote_storage = "{remote_storage_to_toml_inline_table(self.remote_storage)}"
+                """)
             safekeeper = Safekeeper(env=self, id=id, port=port)
             self.safekeepers.append(safekeeper)
 
@@ -820,20 +862,6 @@ class PageserverPort:
     http: int
 
 
-@dataclass
-class LocalFsStorage:
-    root: Path
-
-
-@dataclass
-class S3Storage:
-    bucket: str
-    region: str
-    endpoint: Optional[str]
-
-
-RemoteStorage = Union[LocalFsStorage, S3Storage]
-
 CREATE_TIMELINE_ID_EXTRACTOR = re.compile(r"^Created timeline '(?P<timeline_id>[^']+)'",
                                           re.MULTILINE)
 CREATE_TIMELINE_ID_EXTRACTOR = re.compile(r"^Created timeline '(?P<timeline_id>[^']+)'",
@@ -996,6 +1024,7 @@ class ZenithCli:
             append_pageserver_param_overrides(
                 params_to_update=cmd,
                 remote_storage=self.env.remote_storage,
+                remote_storage_users=self.env.remote_storage_users,
                 pageserver_config_override=self.env.pageserver.config_override)
 
             res = self.raw_cli(cmd)
@@ -1020,6 +1049,7 @@ class ZenithCli:
         append_pageserver_param_overrides(
             params_to_update=start_args,
             remote_storage=self.env.remote_storage,
+            remote_storage_users=self.env.remote_storage_users,
             pageserver_config_override=self.env.pageserver.config_override)
 
         s3_env_vars = None
@@ -1235,22 +1265,13 @@ class ZenithPageserver(PgProtocol):
 def append_pageserver_param_overrides(
     params_to_update: List[str],
     remote_storage: Optional[RemoteStorage],
+    remote_storage_users: RemoteStorageUsers,
     pageserver_config_override: Optional[str] = None,
 ):
-    if remote_storage is not None:
-        if isinstance(remote_storage, LocalFsStorage):
-            pageserver_storage_override = f"local_path='{remote_storage.root}'"
-        elif isinstance(remote_storage, S3Storage):
-            pageserver_storage_override = f"bucket_name='{remote_storage.bucket}',\
-                bucket_region='{remote_storage.region}'"
-
-            if remote_storage.endpoint is not None:
-                pageserver_storage_override += f",endpoint='{remote_storage.endpoint}'"
-
-        else:
-            raise Exception(f'Unknown storage configuration {remote_storage}')
+    if bool(remote_storage_users & RemoteStorageUsers.PAGESERVER) and remote_storage is not None:
+        remote_storage_toml_table = remote_storage_to_toml_inline_table(remote_storage)
         params_to_update.append(
-            f'--pageserver-config-override=remote_storage={{{pageserver_storage_override}}}')
+            f'--pageserver-config-override=remote_storage={remote_storage_toml_table}')
 
     env_overrides = os.getenv('ZENITH_PAGESERVER_OVERRIDES')
     if env_overrides is not None:
@@ -1784,8 +1805,9 @@ class Safekeeper:
 class SafekeeperTimelineStatus:
     acceptor_epoch: int
     flush_lsn: str
-    remote_consistent_lsn: str
     timeline_start_lsn: str
+    backup_lsn: str
+    remote_consistent_lsn: str
 
 
 @dataclass
@@ -1810,8 +1832,9 @@ class SafekeeperHttpClient(requests.Session):
         resj = res.json()
         return SafekeeperTimelineStatus(acceptor_epoch=resj['acceptor_state']['epoch'],
                                         flush_lsn=resj['flush_lsn'],
-                                        remote_consistent_lsn=resj['remote_consistent_lsn'],
-                                        timeline_start_lsn=resj['timeline_start_lsn'])
+                                        timeline_start_lsn=resj['timeline_start_lsn'],
+                                        backup_lsn=resj['backup_lsn'],
+                                        remote_consistent_lsn=resj['remote_consistent_lsn'])
 
     def record_safekeeper_info(self, tenant_id: str, timeline_id: str, body):
         res = self.post(

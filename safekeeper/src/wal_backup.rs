@@ -1,31 +1,30 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, Context, Result};
+use tokio::task::JoinHandle;
 
 use std::cmp::min;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use postgres_ffi::xlog_utils::{XLogFileName, XLogSegNo, XLogSegNoOffsetToRecPtr, PG_TLI};
 use remote_storage::{GenericRemoteStorage, RemoteStorage};
 use tokio::fs::File;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Builder;
 
 use tokio::select;
-use tokio::sync::watch::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::*;
 
 use utils::{lsn::Lsn, zid::ZTenantTimelineId};
 
-use crate::broker::Election;
+use crate::broker::{Election, ElectionLeader};
+use crate::timeline::{GlobalTimelines, Timeline};
 use crate::{broker, SafeKeeperConf};
 
 use once_cell::sync::OnceCell;
-
-static BACKUP_RUNTIME: OnceCell<Runtime> = OnceCell::new();
-const DEFAULT_BACKUP_RUNTIME_SIZE: u32 = 16;
-
-const MIN_WAL_SEGMENT_SIZE: usize = 1 << 20; // 1MB
-const MAX_WAL_SEGMENT_SIZE: usize = 1 << 30; // 1GB
 
 const BACKUP_ELECTION_NAME: &str = "WAL_BACKUP";
 
@@ -34,166 +33,279 @@ const BROKER_CONNECTION_RETRY_DELAY_MS: u64 = 1000;
 const UPLOAD_FAILURE_RETRY_MIN_MS: u64 = 10;
 const UPLOAD_FAILURE_RETRY_MAX_MS: u64 = 5000;
 
-#[allow(clippy::too_many_arguments)]
-async fn backup_task(
-    backup_start: Lsn,
-    timeline_id: ZTenantTimelineId,
-    timeline_dir: PathBuf,
-    mut segment_size_set: Receiver<u32>,
-    mut lsn_durable: Receiver<Lsn>,
-    mut shutdown: Receiver<bool>,
-    lsn_backed_up: Sender<Lsn>,
-    election: Election,
-) -> Result<()> {
-    info!("Starting backup task, backup_lsn {}", backup_start);
+pub fn wal_backup_launcher_thread_main(
+    conf: SafeKeeperConf,
+    wal_backup_launcher_rx: Receiver<ZTenantTimelineId>,
+) {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(conf.backup_runtime_threads)
+        .enable_all()
+        .build()
+        .expect("failed to create wal backup runtime");
 
-    segment_size_set
-        .changed()
-        .await
-        .expect("Failed to recieve wal segment size");
-    let wal_seg_size = *segment_size_set.borrow() as usize;
-    ensure!(
-        (MIN_WAL_SEGMENT_SIZE..=MAX_WAL_SEGMENT_SIZE).contains(&wal_seg_size),
-        "Invalid wal seg size provided, should be between 1MiB and 1GiB per postgres"
+    rt.block_on(async {
+        wal_backup_launcher_main_loop(conf, wal_backup_launcher_rx).await;
+    });
+}
+
+/// Check whether wal backup is required for timeline and mark that launcher is
+/// aware of current status (if timeline exists).
+fn is_wal_backup_required(zttid: ZTenantTimelineId) -> bool {
+    if let Some(tli) = GlobalTimelines::get_loaded(zttid) {
+        tli.wal_backup_attend()
+    } else {
+        false
+    }
+}
+
+struct WalBackupTaskHandle {
+    shutdown_tx: Sender<()>,
+    handle: JoinHandle<()>,
+}
+
+/// Sits on wal_backup_launcher_rx and starts/stops per timeline wal backup
+/// tasks. Having this in separate task simplifies locking, allows to reap
+/// panics and separate elections from offloading itself.
+async fn wal_backup_launcher_main_loop(
+    conf: SafeKeeperConf,
+    mut wal_backup_launcher_rx: Receiver<ZTenantTimelineId>,
+) {
+    info!(
+        "wal backup launcher started, remote config {:?}",
+        conf.remote_storage
     );
 
-    let mut backup_lsn = backup_start;
+    let conf_ = conf.clone();
+    REMOTE_STORAGE.get_or_init(|| {
+        let rs = conf_.remote_storage.as_ref().map(|c| {
+            GenericRemoteStorage::new(conf_.workdir, c).expect("failed to create remote storage")
+        });
+
+        Box::new(rs)
+    });
+
+    let mut tasks: HashMap<ZTenantTimelineId, WalBackupTaskHandle> = HashMap::new();
 
     loop {
-        let mut leader = None;
-        let mut retry_attempt = 0u64;
+        // channel is never expected to get closed
+        let zttid = wal_backup_launcher_rx.recv().await.unwrap();
+        let is_wal_backup_required = is_wal_backup_required(zttid);
+        if conf.remote_storage.is_none() {
+            continue; /* just drain the channel and do nothing */
+        }
+        // do we need to do anything at all?
+        if is_wal_backup_required != tasks.contains_key(&zttid) {
+            if is_wal_backup_required {
+                // need to start the task
+                info!("starting wal backup task for {}", zttid);
 
-        select! {
-            result = broker::get_leader(&election) => {
-                match result {
-                    Ok(l) => { leader = Some(l);},
-                    Err(e) => {
-                        error!("Error during leader election {:?}", e);
-                        sleep(Duration::from_millis(BROKER_CONNECTION_RETRY_DELAY_MS)).await;
-                        continue;
+                // TODO: decide who should offload in launcher itself by simply checking current state
+                let election_name = broker::get_campaign_name(
+                    BACKUP_ELECTION_NAME.to_string(),
+                    conf.broker_etcd_prefix.clone(),
+                    &zttid,
+                );
+                let my_candidate_name = broker::get_candiate_name(conf.my_id);
+                let election = broker::Election::new(
+                    election_name,
+                    my_candidate_name,
+                    conf.broker_endpoints.clone(),
+                );
+
+                let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+                let timeline_dir = conf.timeline_dir(&zttid);
+
+                let handle = tokio::spawn(
+                    backup_task_main(zttid, timeline_dir, shutdown_rx, election)
+                        .instrument(info_span!("WAL backup", zttid = %zttid)),
+                );
+
+                tasks.insert(
+                    zttid,
+                    WalBackupTaskHandle {
+                        shutdown_tx,
+                        handle,
                     },
-                }
-            }
-            _ = shutdown.changed() => {}
-        }
-
-        let mut cancel = false;
-
-        if *shutdown.borrow() {
-            if let Some(l) = leader.as_ref() {
-                l.give_up()
-                    .await
-                    .context("failed to drop election on shutdown")?;
-            }
-
-            break;
-        }
-
-        // TODO: antons - replace with backup start LSN discovery after leadership acquisition
-        // backup_lsn = backup_start;
-
-        loop {
-            // If no changes to LSN we should retry failed upload anyway; No jitter for simplicity, this should be in S3 library anyway
-            let retry_delay = if retry_attempt > 0 {
-                min(
-                    UPLOAD_FAILURE_RETRY_MIN_MS << retry_attempt,
-                    UPLOAD_FAILURE_RETRY_MAX_MS,
-                )
+                );
             } else {
-                u64::MAX
-            };
+                // need to stop the task
+                info!("stopping wal backup task for {}", zttid);
 
-            select! {
-                durable_changed  = lsn_durable.changed() => {
-                    if let Err(e) = durable_changed {
-                        error!("Channel closed shutting down wal backup {:?}", e);
-                        cancel = true;
-                        break;
-                    }
+                let wb_handle = tasks.remove(&zttid).unwrap();
+                // Tell the task to shutdown. Error means task exited earlier, that's ok.
+                let _ = wb_handle.shutdown_tx.send(()).await;
+                // Await the task itself. TODO: restart panicked tasks earlier.
+                // Hm, why I can't await on reference to handle?
+                if let Err(e) = wb_handle.handle.await {
+                    warn!("WAL backup task for {} panicked: {}", zttid, e);
                 }
-                _ = shutdown.changed() => {}
-                _ = sleep(Duration::from_millis(retry_delay)) => {}
+            }
+        }
+    }
+}
+
+struct WalBackupTask {
+    timeline: Arc<Timeline>,
+    timeline_dir: PathBuf,
+    wal_seg_size: usize,
+    commit_lsn_watch_rx: watch::Receiver<Lsn>,
+    leader: Option<ElectionLeader>,
+    election: Election,
+}
+
+/// Offload single timeline.
+async fn backup_task_main(
+    zttid: ZTenantTimelineId,
+    timeline_dir: PathBuf,
+    mut shutdown_tx: Receiver<()>,
+    election: Election,
+) {
+    info!("started");
+    let timeline: Arc<Timeline> = if let Some(tli) = GlobalTimelines::get_loaded(zttid) {
+        tli
+    } else {
+        /* Timeline could get deleted while task was starting, just exit then. */
+        info!("no timeline, exiting");
+        return;
+    };
+
+    let mut wb = WalBackupTask {
+        wal_seg_size: timeline.get_wal_seg_size(),
+        commit_lsn_watch_rx: timeline.get_commit_lsn_watch_rx(),
+        timeline,
+        timeline_dir,
+        leader: None,
+        election,
+    };
+
+    // task is spinned up only when wal_seg_size already initialized
+    assert!(wb.wal_seg_size > 0);
+
+    let mut canceled = false;
+    select! {
+        _ = wb.run() => {}
+        _ = shutdown_tx.recv() => {
+            canceled = true;
+        }
+    }
+    if let Some(l) = wb.leader {
+        l.give_up().await;
+    }
+    info!("task {}", if canceled { "canceled" } else { "terminated" });
+}
+
+impl WalBackupTask {
+    async fn run(&mut self) {
+        let mut backup_lsn = Lsn(0);
+
+        // election loop
+        loop {
+            let mut retry_attempt = 0u64;
+
+            if let Some(ref l) = self.leader {
+                l.give_up().await;
             }
 
-            if *shutdown.borrow() {
-                info!("Shutting down wal backup");
-                cancel = true;
-                break;
+            match broker::get_leader(&self.election).await {
+                Ok(l) => {
+                    self.leader = Some(l);
+                }
+                Err(e) => {
+                    error!("error during leader election {:?}", e);
+                    sleep(Duration::from_millis(BROKER_CONNECTION_RETRY_DELAY_MS)).await;
+                    continue;
+                }
             }
 
-            let commit_lsn = *lsn_durable.borrow();
+            // offload loop
+            loop {
+                if retry_attempt == 0 {
+                    // wait for new WAL to arrive
+                    if let Err(e) = self.commit_lsn_watch_rx.changed().await {
+                        // should never happen, as we hold Arc to timeline.
+                        error!("commit_lsn watch shut down: {:?}", e);
+                        return;
+                    }
+                } else {
+                    // or just sleep if we errored previously
+                    let retry_delay = min(
+                        UPLOAD_FAILURE_RETRY_MIN_MS << retry_attempt,
+                        UPLOAD_FAILURE_RETRY_MAX_MS,
+                    );
+                    sleep(Duration::from_millis(retry_delay)).await;
+                }
 
-            ensure!(
-                commit_lsn >= backup_lsn,
-                "backup lsn should never pass commit lsn"
-            );
+                let commit_lsn = *self.commit_lsn_watch_rx.borrow();
+                assert!(
+                    commit_lsn >= backup_lsn,
+                    "backup lsn should never pass commit lsn"
+                );
 
-            if backup_lsn.segment_number(wal_seg_size) == commit_lsn.segment_number(wal_seg_size) {
-                continue;
-            }
+                if backup_lsn.segment_number(self.wal_seg_size)
+                    == commit_lsn.segment_number(self.wal_seg_size)
+                {
+                    continue; /* nothing to do, common case as we wake up on every commit_lsn bump */
+                }
+                // Perhaps peers advanced the position, check shmem value.
+                backup_lsn = self.timeline.get_wal_backup_lsn();
+                if backup_lsn.segment_number(self.wal_seg_size)
+                    == commit_lsn.segment_number(self.wal_seg_size)
+                {
+                    continue;
+                }
 
-            if let Some(l) = leader.as_ref() {
-                // Optimization idea for later:
-                //  Avoid checking election leader every time by returning current lease grant expiration time
-                //  Re-check leadership only after expiration time,
-                //  such approach woud reduce overhead on write-intensive workloads
+                if let Some(l) = self.leader.as_mut() {
+                    // Optimization idea for later:
+                    //  Avoid checking election leader every time by returning current lease grant expiration time
+                    //  Re-check leadership only after expiration time,
+                    //  such approach woud reduce overhead on write-intensive workloads
 
-                match l.check_am_i(election.election_name.clone(), election.candidate_name.clone()).await {
-                    Ok(leader) => {
-                        if !leader {
-                            info!("Leader has changed");
+                    match l
+                        .check_am_i(
+                            self.election.election_name.clone(),
+                            self.election.candidate_name.clone(),
+                        )
+                        .await
+                    {
+                        Ok(leader) => {
+                            if !leader {
+                                info!("leader has changed");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("error validating leader, {:?}", e);
                             break;
                         }
                     }
+                }
+
+                match backup_lsn_range(
+                    backup_lsn,
+                    commit_lsn,
+                    self.wal_seg_size,
+                    self.timeline.zttid,
+                    &self.timeline_dir,
+                )
+                .await
+                {
+                    Ok(backup_lsn_result) => {
+                        backup_lsn = backup_lsn_result;
+                        self.timeline.set_wal_backup_lsn(backup_lsn_result);
+                        retry_attempt = 0;
+                    }
                     Err(e) => {
-                        warn!("Error validating leader, {:?}", e);
-                        break;
+                        error!(
+                            "failure in backup backup commit_lsn {} backup lsn {}, {:?}",
+                            commit_lsn, backup_lsn, e
+                        );
+
+                        retry_attempt += 1;
                     }
                 }
             }
-
-            debug!(
-                "Woken up for lsn {} committed, will back it up. backup lsn {}",
-                commit_lsn, backup_lsn
-            );
-
-            match backup_lsn_range(
-                backup_lsn,
-                commit_lsn,
-                wal_seg_size,
-                timeline_id,
-                timeline_dir.clone(),
-            )
-            .await
-            {
-                Ok(backup_lsn_result) => {
-                    backup_lsn = backup_lsn_result;
-                    lsn_backed_up.send(backup_lsn)?;
-                    retry_attempt = 0;
-                }
-                Err(e) => {
-                    error!(
-                        "Failure in backup backup commit_lsn {} backup lsn {}, {:?}",
-                        commit_lsn, backup_lsn, e
-                    );
-
-                    retry_attempt += 1;
-                }
-            }
-        }
-
-        if let Some(l) = leader {
-            l.give_up()
-                .await
-                .context("failed to resign from election")?;
-        }
-
-        if cancel {
-            break;
         }
     }
-
-    Ok(())
 }
 
 pub async fn backup_lsn_range(
@@ -201,38 +313,32 @@ pub async fn backup_lsn_range(
     end_lsn: Lsn,
     wal_seg_size: usize,
     timeline_id: ZTenantTimelineId,
-    timeline_dir: PathBuf,
+    timeline_dir: &Path,
 ) -> Result<Lsn> {
     let mut res = start_lsn;
-    for s in get_segments(start_lsn, end_lsn, wal_seg_size) {
-        let seg_backup = backup_single_segment(s, timeline_id, timeline_dir.clone()).await;
+    let segments = get_segments(start_lsn, end_lsn, wal_seg_size);
+    for s in &segments {
+        backup_single_segment(s, timeline_id, timeline_dir)
+            .await
+            .with_context(|| format!("offloading segno {}", s.seg_no))?;
 
-        // TODO: antons limit this only to Not Found errors
-        if seg_backup.is_err() && start_lsn.is_valid() {
-            error!("Segment {} not found in timeline {}", s.seg_no, timeline_id)
-        }
-
-        ensure!(
-            start_lsn >= s.start_lsn || start_lsn.is_valid(),
-            "Out of order segment upload detected"
-        );
-
-        if res == s.start_lsn {
-            res = s.end_lsn;
-        } else {
-            warn!("Out of order Segment {} upload had been detected for timeline {}. Backup Lsn {}, Segment Start Lsn {}", s.seg_no, timeline_id, res, s.start_lsn)
-        }
+        res = s.end_lsn;
     }
-
+    info!(
+        "offloaded segnos {:?} up to {}, previous backup_lsn {}",
+        segments.iter().map(|&s| s.seg_no).collect::<Vec<_>>(),
+        end_lsn,
+        start_lsn,
+    );
     Ok(res)
 }
 
 async fn backup_single_segment(
-    seg: Segment,
+    seg: &Segment,
     timeline_id: ZTenantTimelineId,
-    timeline_dir: PathBuf,
+    timeline_dir: &Path,
 ) -> Result<()> {
-    let segment_file_name = seg.file_path(timeline_dir.as_path())?;
+    let segment_file_name = seg.file_path(timeline_dir)?;
     let dest_name = PathBuf::from(format!(
         "{}/{}",
         timeline_id.tenant_id, timeline_id.timeline_id
@@ -251,138 +357,6 @@ async fn backup_single_segment(
     debug!("Backup of {} done", segment_file_name.display());
 
     Ok(())
-}
-
-pub struct WalBackup {
-    wal_segment_size: Sender<u32>,
-    lsn_committed: Sender<Lsn>,
-    lsn_backed_up: Receiver<Lsn>,
-    shutdown: Sender<bool>,
-}
-
-impl WalBackup {
-    pub fn new(
-        wal_segment_size: Sender<u32>,
-        lsn_committed: Sender<Lsn>,
-        lsn_backed_up: Receiver<Lsn>,
-        shutdown: Sender<bool>,
-    ) -> Self {
-        Self {
-            wal_segment_size,
-            lsn_committed,
-            lsn_backed_up,
-            shutdown,
-        }
-    }
-
-    pub fn set_wal_seg_size(&self, wal_seg_size: u32) -> Result<()> {
-        self.wal_segment_size
-            .send(wal_seg_size)
-            .context("Failed to notify wal backup regarding wal segment size")?;
-        Ok(())
-    }
-
-    pub fn notify_lsn_committed(&self, lsn: Lsn) -> Result<()> {
-        self.lsn_committed
-            .send(lsn)
-            .context("Failed to notify wal backup regarding committed lsn")?;
-        Ok(())
-    }
-
-    pub fn shutdown(&self) -> Result<()> {
-        self.shutdown
-            .send(true)
-            .context("Failed to send shutdown signal to wal backup task")?;
-        // TODO: antons we may need to await the task here
-        Ok(())
-    }
-
-    pub fn get_backup_lsn(&self) -> Lsn {
-        *self.lsn_backed_up.borrow()
-    }
-}
-
-pub fn create(
-    conf: &SafeKeeperConf,
-    timeline_id: &ZTenantTimelineId,
-    backup_start: Lsn,
-) -> Result<WalBackup> {
-    let rt_size = usize::try_from(
-        conf.backup_runtime_threads
-            .unwrap_or(DEFAULT_BACKUP_RUNTIME_SIZE),
-    )
-    .expect("Could not get configuration value for backup_runtime_threads");
-
-    let runtime = BACKUP_RUNTIME.get_or_init(|| {
-        info!("Initializing backup async runtime with {} threads", rt_size);
-
-        Builder::new_multi_thread()
-            .worker_threads(rt_size)
-            .enable_all()
-            .build()
-            .expect("Failed to create wal backup runtime")
-    });
-
-    let (lsn_committed_sender, lsn_committed_receiver) = watch::channel(Lsn::INVALID);
-    let (lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
-    let (wal_seg_size_sender, wal_seg_size_receiver) = watch::channel::<u32>(0);
-    let (shutdown_sender, shutdown_receiver) = watch::channel::<bool>(false);
-
-    let _ = REMOTE_STORAGE.get_or_init(|| {
-        let rs = conf.backup_storage.as_ref().map(|c| {
-            GenericRemoteStorage::new(conf.timeline_dir(timeline_id), c)
-                .expect("Failed to create remote storage")
-        });
-
-        Box::new(rs)
-    });
-
-    let election_name = broker::get_campaign_name(
-        BACKUP_ELECTION_NAME.to_string(),
-        conf.broker_etcd_prefix.clone(),
-        timeline_id,
-    );
-    let my_candidate_name = broker::get_candiate_name(conf.my_id);
-    let election = broker::Election::new(
-        election_name,
-        my_candidate_name,
-        conf.broker_endpoints.clone(),
-    );
-
-    runtime.spawn(
-        backup_task(
-            backup_start,
-            *timeline_id,
-            conf.timeline_dir(timeline_id),
-            wal_seg_size_receiver,
-            lsn_committed_receiver,
-            shutdown_receiver,
-            lsn_backed_up_sender,
-            election,
-        )
-        .instrument(info_span!("Wal Backup", timeline_id.timeline_id = %timeline_id)),
-    );
-
-    Ok(WalBackup::new(
-        wal_seg_size_sender,
-        lsn_committed_sender,
-        lsn_backed_up_receiver,
-        shutdown_sender,
-    ))
-}
-
-pub fn create_noop() -> WalBackup {
-    let (lsn_committed_sender, _lsn_committed_receiver) = watch::channel(Lsn::INVALID);
-    let (_lsn_backed_up_sender, lsn_backed_up_receiver) = watch::channel(Lsn::INVALID);
-    let (wal_seg_size_sender, _wal_seg_size_receiver) = watch::channel::<u32>(0);
-    let (shutdown_sender, _shutdown_receiver) = watch::channel::<bool>(false);
-
-    WalBackup::new(
-        wal_seg_size_sender,
-        lsn_committed_sender,
-        lsn_backed_up_receiver,
-        shutdown_sender,
-    )
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -425,13 +399,12 @@ fn get_segments(start: Lsn, end: Lsn, seg_size: usize) -> Vec<Segment> {
             Segment::new(s, Lsn::from(start_lsn), Lsn::from(end_lsn))
         })
         .collect();
-
     res
 }
 
 static REMOTE_STORAGE: OnceCell<Box<Option<GenericRemoteStorage>>> = OnceCell::new();
 
-async fn backup_object(source_file: &PathBuf, size: usize, destination: &Path) -> Result<()> {
+async fn backup_object(source_file: &Path, size: usize, destination: &Path) -> Result<()> {
     let storage = REMOTE_STORAGE.get().expect("failed to get remote storage");
 
     let file = File::open(&source_file).await?;

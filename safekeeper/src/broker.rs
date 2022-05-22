@@ -1,5 +1,6 @@
 //! Communication with etcd, providing safekeeper peers and pageserver coordination.
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
@@ -69,26 +70,23 @@ pub struct ElectionLeader {
 
 impl ElectionLeader {
     pub async fn check_am_i(
-        &self,
+        &mut self,
         election_name: String,
         candidate_name: String,
     ) -> Result<bool> {
-        let mut c = self.client.clone();
-        let resp = c.leader(election_name).await?;
+        let resp = self.client.leader(election_name).await?;
 
-        let kv = resp.kv().expect("failed to get leader response");
-        let leader = kv.value_str().expect("failed to get campaign leader value");
+        let kv = resp.kv().ok_or(anyhow!("failed to get leader response"))?;
+        let leader = kv.value_str()?;
 
         Ok(leader == candidate_name)
     }
 
-    pub async fn give_up(&self) -> Result<()> {
+    pub async fn give_up(&self) {
         self.keep_alive.abort();
         // TODO: it'll be wise to resign here but it'll happen after lease expiration anyway
         // should we await for keep alive termination?
         // self.keep_alive.await;
-
-        Ok(())
     }
 }
 
@@ -106,14 +104,17 @@ pub async fn get_leader(req: &Election) -> Result<ElectionLeader> {
 
     let keep_alive = spawn::<_>(lease_keep_alive(client.clone(), lease_id));
 
-    let resp = client
+    if let Err(e) = client
         .campaign(
             req.election_name.clone(),
             req.candidate_name.clone(),
             lease_id,
         )
-        .await?;
-    let _leader = resp.leader().unwrap();
+        .await
+    {
+        keep_alive.abort();
+        return Err(e.into());
+    }
 
     Ok(ElectionLeader { client, keep_alive })
 }
@@ -157,27 +158,6 @@ pub fn get_candiate_name(system_id: ZNodeId) -> String {
     format!("id_{}", system_id)
 }
 
-pub async fn is_leader(
-    election_name: String,
-    timeline_id: &ZTenantTimelineId,
-    broker_etcd_prefix: String,
-    broker_endpoints: &Vec<Url>,
-    system_id: ZNodeId,
-) -> Result<bool> {
-    let mut client = Client::connect(broker_endpoints, None)
-        .await
-        .context("failed to get etcd client")?;
-
-    let campaign_name = get_campaign_name(election_name, broker_etcd_prefix, timeline_id);
-    let resp = client.leader(campaign_name).await?;
-
-    let kv = resp.kv().expect("failed to get leader response");
-    let leader = kv.value_str().expect("failed to get campaign leader value");
-
-    let my_candidate_name = get_candiate_name(system_id);
-    Ok(leader == my_candidate_name)
-}
-
 /// Push once in a while data about all active timelines to the broker.
 async fn push_loop(conf: SafeKeeperConf) -> anyhow::Result<()> {
     let mut client = Client::connect(&conf.broker_endpoints, None).await?;
@@ -193,7 +173,7 @@ async fn push_loop(conf: SafeKeeperConf) -> anyhow::Result<()> {
         // sensitive and there is no risk of deadlock as we don't await while
         // lock is held.
         for zttid in GlobalTimelines::get_active_timelines() {
-            if let Ok(tli) = GlobalTimelines::get(&conf, zttid, false) {
+            if let Some(tli) = GlobalTimelines::get_loaded(zttid) {
                 let sk_info = tli.get_public_info(&conf)?;
                 let put_opts = PutOptions::new().with_lease(lease.id());
                 client
@@ -240,7 +220,7 @@ async fn pull_loop(conf: SafeKeeperConf) -> Result<()> {
                     // note: there are blocking operations below, but it's considered fine for now
                     if let Ok(tli) = GlobalTimelines::get(&conf, zttid, false) {
                         for (safekeeper_id, info) in sk_info {
-                            tli.record_safekeeper_info(&info, safekeeper_id)?
+                            tli.record_safekeeper_info(&info, safekeeper_id).await?
                         }
                     }
                 }

@@ -167,7 +167,7 @@ pub struct SafekeeperConf {
     pub pg_port: u16,
     pub http_port: u16,
     pub sync: bool,
-    pub backup_storage: Option<String>,
+    pub remote_storage: Option<String>,
     pub backup_threads: Option<u32>,
 }
 
@@ -178,7 +178,7 @@ impl Default for SafekeeperConf {
             pg_port: 0,
             http_port: 0,
             sync: true,
-            backup_storage: None,
+            remote_storage: None,
             backup_threads: None,
         }
     }

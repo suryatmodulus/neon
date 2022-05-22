@@ -146,8 +146,8 @@ impl SafekeeperNode {
         if let Some(threads) = self.conf.backup_threads {
             cmd.args(&["--backup-threads", threads.to_string().as_ref()]);
         }
-        if let Some(ref backup_storage) = self.conf.backup_storage {
-            cmd.args(&["--backup-storage", backup_storage]);
+        if let Some(ref remote_storage) = self.conf.remote_storage {
+            cmd.args(&["--remote-storage", remote_storage]);
         }
 
         if !cmd.status()?.success() {

@@ -1,3 +1,4 @@
+use defaults::DEFAULT_WAL_BACKUP_RUNTIME_THREADS;
 //
 use remote_storage::RemoteStorageConfig;
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ pub mod defaults {
     pub const DEFAULT_HTTP_LISTEN_PORT: u16 = 7676;
     pub const DEFAULT_HTTP_LISTEN_ADDR: &str = formatcp!("127.0.0.1:{DEFAULT_HTTP_LISTEN_PORT}");
     pub const DEFAULT_RECALL_PERIOD: Duration = Duration::from_secs(10);
+    pub const DEFAULT_WAL_BACKUP_RUNTIME_THREADS: usize = 8;
 }
 
 #[derive(Debug, Clone)]
@@ -49,8 +51,8 @@ pub struct SafeKeeperConf {
     pub listen_pg_addr: String,
     pub listen_http_addr: String,
     pub recall_period: Duration,
-    pub backup_storage: Option<RemoteStorageConfig>,
-    pub backup_runtime_threads: Option<u32>,
+    pub remote_storage: Option<RemoteStorageConfig>,
+    pub backup_runtime_threads: usize,
     pub my_id: ZNodeId,
     pub broker_endpoints: Vec<Url>,
     pub broker_etcd_prefix: String,
@@ -78,12 +80,12 @@ impl Default for SafeKeeperConf {
             no_sync: false,
             listen_pg_addr: defaults::DEFAULT_PG_LISTEN_ADDR.to_string(),
             listen_http_addr: defaults::DEFAULT_HTTP_LISTEN_ADDR.to_string(),
-            backup_storage: None,
+            remote_storage: None,
             recall_period: defaults::DEFAULT_RECALL_PERIOD,
             my_id: ZNodeId(0),
             broker_endpoints: Vec::new(),
             broker_etcd_prefix: etcd_broker::DEFAULT_NEON_BROKER_ETCD_PREFIX.to_string(),
-            backup_runtime_threads: None,
+            backup_runtime_threads: DEFAULT_WAL_BACKUP_RUNTIME_THREADS,
         }
     }
 }
