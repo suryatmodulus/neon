@@ -414,7 +414,7 @@ def test_wal_removal(zenith_env_builder: ZenithEnvBuilder):
         time.sleep(0.5)
 
 
-@pytest.mark.parametrize('storage_type', ['local_fs', 'mock_s3'])
+@pytest.mark.parametrize('storage_type', ['mock_s3', 'local_fs'])
 def test_wal_backup(zenith_env_builder: ZenithEnvBuilder, storage_type: str):
     zenith_env_builder.num_safekeepers = 3
     if storage_type == 'local_fs':

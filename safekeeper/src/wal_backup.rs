@@ -284,7 +284,6 @@ impl WalBackupTask {
                     backup_lsn,
                     commit_lsn,
                     self.wal_seg_size,
-                    self.timeline.zttid,
                     &self.timeline_dir,
                 )
                 .await
@@ -296,8 +295,8 @@ impl WalBackupTask {
                     }
                     Err(e) => {
                         error!(
-                            "failure in backup backup commit_lsn {} backup lsn {}, {:?}",
-                            commit_lsn, backup_lsn, e
+                            "failed while offloading range {}-{}: {:?}",
+                            backup_lsn, commit_lsn, e
                         );
 
                         retry_attempt += 1;
@@ -312,13 +311,12 @@ pub async fn backup_lsn_range(
     start_lsn: Lsn,
     end_lsn: Lsn,
     wal_seg_size: usize,
-    timeline_id: ZTenantTimelineId,
     timeline_dir: &Path,
 ) -> Result<Lsn> {
     let mut res = start_lsn;
     let segments = get_segments(start_lsn, end_lsn, wal_seg_size);
     for s in &segments {
-        backup_single_segment(s, timeline_id, timeline_dir)
+        backup_single_segment(s, timeline_dir)
             .await
             .with_context(|| format!("offloading segno {}", s.seg_no))?;
 
@@ -333,27 +331,11 @@ pub async fn backup_lsn_range(
     Ok(res)
 }
 
-async fn backup_single_segment(
-    seg: &Segment,
-    timeline_id: ZTenantTimelineId,
-    timeline_dir: &Path,
-) -> Result<()> {
+async fn backup_single_segment(seg: &Segment, timeline_dir: &Path) -> Result<()> {
     let segment_file_name = seg.file_path(timeline_dir)?;
-    let dest_name = PathBuf::from(format!(
-        "{}/{}",
-        timeline_id.tenant_id, timeline_id.timeline_id
-    ))
-    .with_file_name(seg.object_name());
-
-    debug!("Backup of {} requested", segment_file_name.display());
-
-    if !segment_file_name.exists() {
-        // TODO: antons return a specific error
-        bail!("Segment file is Missing");
-    }
 
     // TODO: antons implement retry logic
-    backup_object(&segment_file_name, seg.size(), &dest_name).await?;
+    backup_object(&segment_file_name, seg.size()).await?;
     debug!("Backup of {} done", segment_file_name.display());
 
     Ok(())
@@ -404,43 +386,37 @@ fn get_segments(start: Lsn, end: Lsn, seg_size: usize) -> Vec<Segment> {
 
 static REMOTE_STORAGE: OnceCell<Box<Option<GenericRemoteStorage>>> = OnceCell::new();
 
-async fn backup_object(source_file: &Path, size: usize, destination: &Path) -> Result<()> {
+async fn backup_object(source_file: &Path, size: usize) -> Result<()> {
     let storage = REMOTE_STORAGE.get().expect("failed to get remote storage");
 
     let file = File::open(&source_file).await?;
 
     match storage.as_ref() {
         Some(GenericRemoteStorage::Local(local_storage)) => {
+            let destination = local_storage.remote_object_id(source_file)?;
+
             debug!(
                 "local upload about to start from {} to {}",
                 source_file.display(),
                 destination.display()
             );
-            local_storage
-                .upload(file, size, &PathBuf::from(destination), None)
-                .await
+            local_storage.upload(file, size, &destination, None).await
         }
         Some(GenericRemoteStorage::S3(s3_storage)) => {
-            let s3key = s3_storage.remote_object_id(destination).with_context(|| {
-                format!("Could not format remote path for {}", destination.display())
-            })?;
+            let s3key = s3_storage.remote_object_id(source_file)?;
 
             debug!(
-                "S3 upload about to start from {} to {}",
+                "S3 upload about to start from {} to {:?}",
                 source_file.display(),
-                destination.display()
+                s3key
             );
             s3_storage.upload(file, size, &s3key, None).await
         }
+        // FIXME remove this
         None => {
-            info!(
-                "no backup storage configured, skipping backup {}",
-                destination.display()
-            );
-            Ok(())
+            panic!("no backup storage configured",);
         }
-    }
-    .with_context(|| format!("Failed to backup {}", destination.display()))?;
+    }?;
 
     Ok(())
 }

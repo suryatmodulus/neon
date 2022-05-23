@@ -419,6 +419,12 @@ class MockS3Server:
     def secret_key(self) -> str:
         return 'test'
 
+    def access_env_vars(self) -> Dict[Any, Any]:
+        return {
+                'AWS_ACCESS_KEY_ID': self.access_key(),
+                'AWS_SECRET_ACCESS_KEY': self.secret_key(),
+        }
+
     def kill(self):
         self.subprocess.kill()
 
@@ -1052,12 +1058,7 @@ class ZenithCli:
             remote_storage_users=self.env.remote_storage_users,
             pageserver_config_override=self.env.pageserver.config_override)
 
-        s3_env_vars = None
-        if self.env.s3_mock_server:
-            s3_env_vars = {
-                'AWS_ACCESS_KEY_ID': self.env.s3_mock_server.access_key(),
-                'AWS_SECRET_ACCESS_KEY': self.env.s3_mock_server.secret_key(),
-            }
+        s3_env_vars = self.env.s3_mock_server.access_env_vars() if self.env.s3_mock_server else None
         return self.raw_cli(start_args, extra_env_vars=s3_env_vars)
 
     def pageserver_stop(self, immediate=False) -> 'subprocess.CompletedProcess[str]':
@@ -1069,7 +1070,8 @@ class ZenithCli:
         return self.raw_cli(cmd)
 
     def safekeeper_start(self, id: int) -> 'subprocess.CompletedProcess[str]':
-        return self.raw_cli(['safekeeper', 'start', str(id)])
+        s3_env_vars = self.env.s3_mock_server.access_env_vars() if self.env.s3_mock_server else None
+        return self.raw_cli(['safekeeper', 'start', str(id)], extra_env_vars=s3_env_vars)
 
     def safekeeper_stop(self,
                         id: Optional[int] = None,
