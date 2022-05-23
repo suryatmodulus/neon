@@ -105,7 +105,11 @@ def test_many_timelines(zenith_env_builder: ZenithEnvBuilder):
                 m.flush_lsns.append(sk_m.flush_lsn_inexact[(tenant_id.hex, timeline_id)])
                 m.commit_lsns.append(sk_m.commit_lsn_inexact[(tenant_id.hex, timeline_id)])
 
-            for flush_lsn, commit_lsn in zip(m.flush_lsns, m.commit_lsns):
+            for i, (flush_lsn, commit_lsn) in enumerate(zip(m.flush_lsns, m.commit_lsns)):
+                if commit_lsn > flush_lsn:
+                    log.info("something is very wrong!")
+                    log.info(f"{env.safekeepers[i].http_client().timeline_status(tenant_id, timeline_id)}")
+
                 # Invariant. May be < when transaction is in progress.
                 assert commit_lsn <= flush_lsn, f"timeline_id={timeline_id}, timeline_detail={timeline_detail}, sk_metrics={sk_metrics}"
             # We only call collect_metrics() after a transaction is confirmed by
