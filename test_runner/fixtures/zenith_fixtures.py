@@ -421,8 +421,8 @@ class MockS3Server:
 
     def access_env_vars(self) -> Dict[Any, Any]:
         return {
-                'AWS_ACCESS_KEY_ID': self.access_key(),
-                'AWS_SECRET_ACCESS_KEY': self.secret_key(),
+            'AWS_ACCESS_KEY_ID': self.access_key(),
+            'AWS_SECRET_ACCESS_KEY': self.secret_key(),
         }
 
     def kill(self):

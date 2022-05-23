@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tokio::task::JoinHandle;
 
 use std::cmp::min;
