@@ -1,0 +1,156 @@
+openapi: "3.0.2"
+info:
+  title: Compute node control API
+  version: "1.0"
+
+servers:
+  - url: "http://localhost:3080"
+
+paths:
+  /status:
+    get:
+      tags:
+      - Info
+      summary: Get compute node internal status
+      description: ""
+      operationId: getComputeStatus
+      responses:
+        200:
+          description: ComputeState
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeState"
+
+  /metrics.json:
+    get:
+      tags:
+      - Info
+      summary: Get compute node startup metrics in JSON format
+      description: ""
+      operationId: getComputeMetricsJSON
+      responses:
+        200:
+          description: ComputeMetrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeMetrics"
+
+  /insights:
+    get:
+      tags:
+      - Info
+      summary: Get current compute insights in JSON format
+      description: |
+        Note, that this doesn't include any historical data
+      operationId: getComputeInsights
+      responses:
+        200:
+          description: Compute insights
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComputeInsights"
+
+  /info:
+    get:
+      tags:
+      - "info"
+      summary: Get info about the compute Pod/VM
+      description: ""
+      operationId: getInfo
+      responses:
+        "200":
+          description: Info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Info"
+
+  /check_writability:
+    post:
+      tags:
+      - Check
+      summary: Check that we can write new data on this compute
+      description: ""
+      operationId: checkComputeWritability
+      responses:
+        200:
+          description: Check result
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: Error text or 'true' if check passed
+                example: "true"
+
+components:
+  securitySchemes:
+    JWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ComputeMetrics:
+      type: object
+      description: Compute startup metrics
+      required:
+        - sync_safekeepers_ms
+        - basebackup_ms
+        - config_ms
+        - total_startup_ms
+      properties:
+        sync_safekeepers_ms:
+          type: integer
+        basebackup_ms:
+          type: integer
+        config_ms:
+          type: integer
+        total_startup_ms:
+          type: integer
+
+    Info:
+      type: object
+      description: Information about VM/Pod
+      required:
+        - num_cpus
+      properties:
+        num_cpus:
+          type: integer
+
+    ComputeState:
+      type: object
+      required:
+        - status
+        - last_active
+      properties:
+        status:
+          $ref: '#/components/schemas/ComputeStatus'
+        last_active:
+          type: string
+          description: The last detected compute activity timestamp in UTC and RFC3339 format
+          example: "2022-10-12T07:20:50.52Z"
+        error:
+          type: string
+          description: Text of the error during compute startup, if any
+
+    ComputeInsights:
+      type: object
+      properties:
+        pg_stat_statements:
+          description: Contains raw output from pg_stat_statements in JSON format
+          type: array
+          items:
+            type: object
+
+    ComputeStatus:
+      type: string
+      enum:
+        - init
+        - failed
+        - running
+
+security:
+  - JWT: []
