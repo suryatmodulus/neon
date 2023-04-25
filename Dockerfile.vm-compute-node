@@ -1,0 +1,27 @@
+# Note: this file *mostly* just builds on Dockerfile.compute-node
+
+ARG SRC_IMAGE
+ARG VM_INFORMANT_VERSION=v0.1.14
+
+# Pull VM informant and set up inittab
+FROM neondatabase/vm-informant:$VM_INFORMANT_VERSION as informant
+
+RUN set -e \
+	&& rm -f /etc/inittab \
+	&& touch /etc/inittab
+
+RUN set -e \
+	&& CONNSTR="dbname=neondb user=cloud_admin sslmode=disable" \
+	&& ARGS="--auto-restart --pgconnstr=\"$CONNSTR\"" \
+	&& echo "::respawn:su vm-informant -c '/usr/local/bin/vm-informant $ARGS'" >> /etc/inittab
+
+# Combine, starting from non-VM compute node image.
+FROM $SRC_IMAGE as base
+
+# Temporarily set user back to root so we can run adduser
+USER root
+RUN adduser vm-informant --disabled-password --no-create-home
+USER postgres
+
+COPY --from=informant /etc/inittab /etc/inittab
+COPY --from=informant /usr/bin/vm-informant /usr/local/bin/vm-informant
