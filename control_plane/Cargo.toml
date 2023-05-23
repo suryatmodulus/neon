@@ -1,23 +1,33 @@
 [package]
 name = "control_plane"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-tar = "0.4.33"
-postgres = { git = "https://github.com/zenithdb/rust-postgres.git", rev="2949d98df52587d562986aad155dd4e889e408b7" }
-serde = { version = "1.0", features = ["derive"] }
-serde_with = "1.12.0"
-toml = "0.5"
-lazy_static = "1.4"
-regex = "1"
-anyhow = "1.0"
-thiserror = "1"
-nix = "0.23"
-url = "2.2.2"
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+anyhow.workspace = true
+clap.workspace = true
+comfy-table.workspace = true
+git-version.workspace = true
+nix.workspace = true
+once_cell.workspace = true
+postgres.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+url.workspace = true
+# Note: Do not directly depend on pageserver or safekeeper; use pageserver_api or safekeeper_api
+# instead, so that recompile times are better.
+pageserver_api.workspace = true
+postgres_backend.workspace = true
+safekeeper_api.workspace = true
+postgres_connection.workspace = true
+storage_broker.workspace = true
+utils.workspace = true
 
-pageserver = { path = "../pageserver" }
-walkeeper = { path = "../walkeeper" }
-zenith_utils = { path = "../zenith_utils" }
-workspace_hack = { path = "../workspace_hack" }
+workspace_hack.workspace = true
