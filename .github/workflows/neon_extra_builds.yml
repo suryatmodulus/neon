@@ -1,0 +1,154 @@
+name: Check neon with extra platform builds
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
+concurrency:
+  # Allow only one workflow per any non-`main` branch.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'anysha' }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  COPT: '-Werror'
+
+jobs:
+  check-macos-build:
+    if: github.ref_name == 'main' || contains(github.event.pull_request.labels.*.name, 'run-extra-build-macos')
+    timeout-minutes: 90
+    runs-on: macos-latest
+
+    env:
+      # Use release build only, to have less debug info around
+      # Hence keeping target/ (and general cache size) smaller
+      BUILD_TYPE: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Install macOS postgres dependencies
+        run: brew install flex bison openssl protobuf
+
+      - name: Set pg 14 revision for caching
+        id: pg_v14_rev
+        run: echo pg_rev=$(git rev-parse HEAD:vendor/postgres-v14) >> $GITHUB_OUTPUT
+
+      - name: Set pg 15 revision for caching
+        id: pg_v15_rev
+        run: echo pg_rev=$(git rev-parse HEAD:vendor/postgres-v15) >> $GITHUB_OUTPUT
+
+      - name: Cache postgres v14 build
+        id: cache_pg_14
+        uses: actions/cache@v3
+        with:
+          path: pg_install/v14
+          key: v1-${{ runner.os }}-${{ matrix.build_type }}-pg-${{ steps.pg_v14_rev.outputs.pg_rev }}-${{ hashFiles('Makefile') }}
+
+      - name: Cache postgres v15 build
+        id: cache_pg_15
+        uses: actions/cache@v3
+        with:
+          path: pg_install/v15
+          key: v1-${{ runner.os }}-${{ matrix.build_type }}-pg-${{ steps.pg_v15_rev.outputs.pg_rev }}-${{ hashFiles('Makefile') }}
+
+      - name: Set extra env for macOS
+        run: |
+          echo 'LDFLAGS=-L/usr/local/opt/openssl@3/lib' >> $GITHUB_ENV
+          echo 'CPPFLAGS=-I/usr/local/opt/openssl@3/include' >> $GITHUB_ENV
+
+      - name: Cache cargo deps
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            !~/.cargo/registry/src
+            ~/.cargo/git
+            target
+          key: v1-${{ runner.os }}-cargo-${{ hashFiles('./Cargo.lock') }}-${{ hashFiles('./rust-toolchain.toml') }}-rust
+
+      - name: Build postgres v14
+        if: steps.cache_pg_14.outputs.cache-hit != 'true'
+        run: make postgres-v14 -j$(nproc)
+
+      - name: Build postgres v15
+        if: steps.cache_pg_15.outputs.cache-hit != 'true'
+        run: make postgres-v15 -j$(nproc)
+
+      - name: Build neon extensions
+        run: make neon-pg-ext -j$(nproc)
+
+      - name: Run cargo build
+        run: cargo build --all --release
+
+      - name: Check that no warnings are produced
+        run: ./run_clippy.sh
+
+  gather-rust-build-stats:
+    if: github.ref_name == 'main' || contains(github.event.pull_request.labels.*.name, 'run-extra-build-stats')
+    runs-on: [ self-hosted, gen3, large ]
+    container:
+      image: 369495373322.dkr.ecr.eu-central-1.amazonaws.com/rust:pinned
+      options: --init
+
+    env:
+      BUILD_TYPE: release
+      # remove the cachepot wrapper and build without crate caches
+      RUSTC_WRAPPER: ""
+      # build with incremental compilation produce partial results
+      # so do not attempt to cache this build, also disable the incremental compilation
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      # Some of our rust modules use FFI and need those to be checked
+      - name: Get postgres headers
+        run: make postgres-headers -j$(nproc)
+
+      - name: Produce the build stats
+        run: cargo build --all --release --timings
+
+      - name: Upload the build stats
+        id: upload-stats
+        env:
+          BUCKET: neon-github-public-dev
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_DEV }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY_DEV }}
+        run: |
+          REPORT_URL=https://${BUCKET}.s3.amazonaws.com/build-stats/${SHA}/${GITHUB_RUN_ID}/cargo-timing.html
+          aws s3 cp --only-show-errors ./target/cargo-timings/cargo-timing.html "s3://${BUCKET}/build-stats/${SHA}/${GITHUB_RUN_ID}/"
+          echo "report-url=${REPORT_URL}" >> $GITHUB_OUTPUT
+
+      - name: Publish build stats report
+        uses: actions/github-script@v6
+        env:
+          REPORT_URL: ${{ steps.upload-stats.outputs.report-url }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        with:
+          script: |
+            const { REPORT_URL, SHA } = process.env
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: `${SHA}`,
+              state: 'success',
+              target_url: `${REPORT_URL}`,
+              context: `Build stats (release)`,
+            })
