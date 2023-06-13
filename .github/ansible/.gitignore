@@ -1,0 +1,5 @@
+neon_install.tar.gz
+.neon_current_version
+
+collections/*
+!collections/.keep
