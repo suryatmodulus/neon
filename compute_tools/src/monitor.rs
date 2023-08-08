@@ -1,23 +1,23 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::{thread, time};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use log::{debug, info};
 use postgres::{Client, NoTls};
+use tracing::{debug, info};
 
-use crate::zenith::ComputeState;
+use crate::compute::ComputeNode;
 
 const MONITOR_CHECK_INTERVAL: u64 = 500; // milliseconds
 
 // Spin in a loop and figure out the last activity time in the Postgres.
 // Then update it in the shared state. This function never errors out.
 // XXX: the only expected panic is at `RwLock` unwrap().
-fn watch_compute_activity(state: &Arc<RwLock<ComputeState>>) {
+fn watch_compute_activity(compute: &ComputeNode) {
     // Suppose that `connstr` doesn't change
-    let connstr = state.read().unwrap().connstr.clone();
+    let connstr = compute.connstr.as_str();
     // Define `client` outside of the loop to reuse existing connection if it's active.
-    let mut client = Client::connect(&connstr, NoTls);
+    let mut client = Client::connect(connstr, NoTls);
     let timeout = time::Duration::from_millis(MONITOR_CHECK_INTERVAL);
 
     info!("watching Postgres activity at {}", connstr);
@@ -32,7 +32,7 @@ fn watch_compute_activity(state: &Arc<RwLock<ComputeState>>) {
                     info!("connection to postgres closed, trying to reconnect");
 
                     // Connection is closed, reconnect and try again.
-                    client = Client::connect(&connstr, NoTls);
+                    client = Client::connect(connstr, NoTls);
                     continue;
                 }
 
@@ -43,19 +43,25 @@ fn watch_compute_activity(state: &Arc<RwLock<ComputeState>>) {
                          FROM pg_stat_activity
                          WHERE backend_type = 'client backend'
                             AND pid != pg_backend_pid()
-                            AND usename != 'zenith_admin';", // XXX: find a better way to filter other monitors?
+                            AND usename != 'cloud_admin';", // XXX: find a better way to filter other monitors?
                         &[],
                     );
-                let mut last_active = state.read().unwrap().last_active;
+                let mut last_active = compute.state.lock().unwrap().last_active;
 
                 if let Ok(backs) = backends {
                     let mut idle_backs: Vec<DateTime<Utc>> = vec![];
 
                     for b in backs.into_iter() {
-                        let state: String = b.get("state");
-                        let change: String = b.get("state_change");
+                        let state: String = match b.try_get("state") {
+                            Ok(state) => state,
+                            Err(_) => continue,
+                        };
 
                         if state == "idle" {
+                            let change: String = match b.try_get("state_change") {
+                                Ok(state_change) => state_change,
+                                Err(_) => continue,
+                            };
                             let change = DateTime::parse_from_rfc3339(&change);
                             match change {
                                 Ok(t) => idle_backs.push(t.with_timezone(&Utc)),
@@ -68,39 +74,38 @@ fn watch_compute_activity(state: &Arc<RwLock<ComputeState>>) {
                             // Found non-idle backend, so the last activity is NOW.
                             // Save it and exit the for loop. Also clear the idle backend
                             // `state_change` timestamps array as it doesn't matter now.
-                            last_active = Utc::now();
+                            last_active = Some(Utc::now());
                             idle_backs.clear();
                             break;
                         }
                     }
 
-                    // Sort idle backend `state_change` timestamps. The last one corresponds
-                    // to the last activity.
-                    idle_backs.sort();
-                    if let Some(last) = idle_backs.last() {
-                        last_active = *last;
+                    // Get idle backend `state_change` with the max timestamp.
+                    if let Some(last) = idle_backs.iter().max() {
+                        last_active = Some(*last);
                     }
                 }
 
                 // Update the last activity in the shared state if we got a more recent one.
-                let mut state = state.write().unwrap();
+                let mut state = compute.state.lock().unwrap();
+                // NB: `Some(<DateTime>)` is always greater than `None`.
                 if last_active > state.last_active {
                     state.last_active = last_active;
-                    debug!("set the last compute activity time to: {}", last_active);
+                    debug!("set the last compute activity time to: {:?}", last_active);
                 }
             }
             Err(e) => {
-                info!("cannot connect to postgres: {}, retrying", e);
+                debug!("cannot connect to postgres: {}, retrying", e);
 
                 // Establish a new connection and try again.
-                client = Client::connect(&connstr, NoTls);
+                client = Client::connect(connstr, NoTls);
             }
         }
     }
 }
 
 /// Launch a separate compute monitor thread and return its `JoinHandle`.
-pub fn launch_monitor(state: &Arc<RwLock<ComputeState>>) -> Result<thread::JoinHandle<()>> {
+pub fn launch_monitor(state: &Arc<ComputeNode>) -> Result<thread::JoinHandle<()>> {
     let state = Arc::clone(state);
 
     Ok(thread::Builder::new()
