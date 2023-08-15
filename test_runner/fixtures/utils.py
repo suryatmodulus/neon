@@ -1,29 +1,30 @@
+import contextlib
+import json
 import os
+import re
 import subprocess
+import tarfile
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Tuple, TypeVar
+from urllib.parse import urlencode
 
-from typing import Any, List
+import allure
+from psycopg2.extensions import cursor
+
 from fixtures.log_helper import log
+from fixtures.types import TimelineId
+
+Fn = TypeVar("Fn", bound=Callable[..., Any])
 
 
-def get_self_dir() -> str:
-    """ Get the path to the directory where this script lives. """
-    return os.path.dirname(os.path.abspath(__file__))
+def get_self_dir() -> Path:
+    """Get the path to the directory where this script lives."""
+    return Path(__file__).resolve().parent
 
 
-def mkdir_if_needed(path: str) -> None:
-    """ Create a directory if it doesn't already exist
-
-    Note this won't try to create intermediate directories.
-    """
-    try:
-        os.mkdir(path)
-    except FileExistsError:
-        pass
-    assert os.path.isdir(path)
-
-
-def subprocess_capture(capture_dir: str, cmd: List[str], **kwargs: Any) -> str:
-    """ Run a process and capture its output
+def subprocess_capture(capture_dir: Path, cmd: List[str], **kwargs: Any) -> str:
+    """Run a process and capture its output
 
     Output will go to files named "cmd_NNN.stdout" and "cmd_NNN.stderr"
     where "cmd" is the name of the program and NNN is an incrementing
@@ -32,16 +33,22 @@ def subprocess_capture(capture_dir: str, cmd: List[str], **kwargs: Any) -> str:
     If those files already exist, we will overwrite them.
     Returns basepath for files with captured output.
     """
-    assert type(cmd) is list
-    base = os.path.basename(cmd[0]) + '_{}'.format(global_counter())
+    assert isinstance(cmd, list)
+    base = f"{os.path.basename(cmd[0])}_{global_counter()}"
     basepath = os.path.join(capture_dir, base)
-    stdout_filename = basepath + '.stdout'
-    stderr_filename = basepath + '.stderr'
+    stdout_filename = f"{basepath}.stdout"
+    stderr_filename = f"{basepath}.stderr"
 
-    with open(stdout_filename, 'w') as stdout_f:
-        with open(stderr_filename, 'w') as stderr_f:
-            log.info('(capturing output to "{}.stdout")'.format(base))
-            subprocess.run(cmd, **kwargs, stdout=stdout_f, stderr=stderr_f)
+    try:
+        with open(stdout_filename, "w") as stdout_f:
+            with open(stderr_filename, "w") as stderr_f:
+                log.info(f'Capturing stdout to "{base}.stdout" and stderr to "{base}.stderr"')
+                subprocess.run(cmd, **kwargs, stdout=stdout_f, stderr=stderr_f)
+    finally:
+        # Remove empty files if there is no output
+        for filename in (stdout_filename, stderr_filename):
+            if os.stat(filename).st_size == 0:
+                os.remove(filename)
 
     return basepath
 
@@ -50,7 +57,7 @@ _global_counter = 0
 
 
 def global_counter() -> int:
-    """ A really dumb global counter.
+    """A really dumb global counter.
 
     This is useful for giving output files a unique number, so if we run the
     same command multiple times we can keep their output separate.
@@ -60,22 +67,250 @@ def global_counter() -> int:
     return _global_counter
 
 
-def lsn_to_hex(num: int) -> str:
-    """ Convert lsn from int to standard hex notation. """
-    return "{:X}/{:X}".format(num >> 32, num & 0xffffffff)
-
-
-def lsn_from_hex(lsn_hex: str) -> int:
-    """ Convert lsn from hex notation to int. """
-    l, r = lsn_hex.split('/')
-    return (int(l, 16) << 32) + int(r, 16)
-
-
-def print_gc_result(row):
+def print_gc_result(row: Dict[str, Any]):
     log.info("GC duration {elapsed} ms".format_map(row))
     log.info(
-        "  REL    total: {layer_relfiles_total}, needed_by_cutoff {layer_relfiles_needed_by_cutoff}, needed_by_branches: {layer_relfiles_needed_by_branches}, not_updated: {layer_relfiles_not_updated}, needed_as_tombstone {layer_relfiles_needed_as_tombstone}, removed: {layer_relfiles_removed}, dropped: {layer_relfiles_dropped}"
-        .format_map(row))
-    log.info(
-        "  NONREL total: {layer_nonrelfiles_total}, needed_by_cutoff {layer_nonrelfiles_needed_by_cutoff}, needed_by_branches: {layer_nonrelfiles_needed_by_branches}, not_updated: {layer_nonrelfiles_not_updated}, needed_as_tombstone {layer_nonrelfiles_needed_as_tombstone}, removed: {layer_nonrelfiles_removed}, dropped: {layer_nonrelfiles_dropped}"
-        .format_map(row))
+        "  total: {layers_total}, needed_by_cutoff {layers_needed_by_cutoff}, needed_by_pitr {layers_needed_by_pitr}"
+        " needed_by_branches: {layers_needed_by_branches}, not_updated: {layers_not_updated}, removed: {layers_removed}".format_map(
+            row
+        )
+    )
+
+
+def query_scalar(cur: cursor, query: str) -> Any:
+    """
+    It is a convenience wrapper to avoid repetitions
+    of cur.execute(); cur.fetchone()[0]
+
+    And this is mypy friendly, because without None
+    check mypy says that Optional is not indexable.
+    """
+    cur.execute(query)
+    var = cur.fetchone()
+    assert var is not None
+    return var[0]
+
+
+# Traverse directory to get total size.
+def get_dir_size(path: str) -> int:
+    """Return size in bytes."""
+    totalbytes = 0
+    for root, dirs, files in os.walk(path):
+        for name in files:
+            try:
+                totalbytes += os.path.getsize(os.path.join(root, name))
+            except FileNotFoundError:
+                pass  # file could be concurrently removed
+
+    return totalbytes
+
+
+def get_timeline_dir_size(path: Path) -> int:
+    """Get the timeline directory's total size, which only counts the layer files' size."""
+    sz = 0
+    for dir_entry in path.iterdir():
+        with contextlib.suppress(Exception):
+            # file is an image layer
+            _ = parse_image_layer(dir_entry.name)
+            sz += dir_entry.stat().st_size
+            continue
+
+        with contextlib.suppress(Exception):
+            # file is a delta layer
+            _ = parse_delta_layer(dir_entry.name)
+            sz += dir_entry.stat().st_size
+    return sz
+
+
+def parse_image_layer(f_name: str) -> Tuple[int, int, int]:
+    """Parse an image layer file name. Return key start, key end, and snapshot lsn"""
+    parts = f_name.split("__")
+    key_parts = parts[0].split("-")
+    return int(key_parts[0], 16), int(key_parts[1], 16), int(parts[1], 16)
+
+
+def parse_delta_layer(f_name: str) -> Tuple[int, int, int, int]:
+    """Parse a delta layer file name. Return key start, key end, lsn start, and lsn end"""
+    parts = f_name.split("__")
+    key_parts = parts[0].split("-")
+    lsn_parts = parts[1].split("-")
+    return (
+        int(key_parts[0], 16),
+        int(key_parts[1], 16),
+        int(lsn_parts[0], 16),
+        int(lsn_parts[1], 16),
+    )
+
+
+def get_scale_for_db(size_mb: int) -> int:
+    """Returns pgbench scale factor for given target db size in MB.
+
+    Ref https://www.cybertec-postgresql.com/en/a-formula-to-calculate-pgbench-scaling-factor-for-target-db-size/
+    """
+
+    return round(0.06689 * size_mb - 0.5)
+
+
+ATTACHMENT_NAME_REGEX: re.Pattern = re.compile(  # type: ignore[type-arg]
+    r"regression\.diffs|.+\.(?:log|stderr|stdout|filediff|metrics|html)"
+)
+
+
+def allure_attach_from_dir(dir: Path):
+    """Attach all non-empty files from `dir` that matches `ATTACHMENT_NAME_REGEX` to Allure report"""
+
+    for attachment in Path(dir).glob("**/*"):
+        if ATTACHMENT_NAME_REGEX.fullmatch(attachment.name) and attachment.stat().st_size > 0:
+            source = str(attachment)
+            name = str(attachment.relative_to(dir))
+
+            # compress files larger than 1Mb, they're hardly readable in a browser
+            if attachment.stat().st_size > 1024 * 1024:
+                source = f"{attachment}.tar.gz"
+                with tarfile.open(source, "w:gz") as tar:
+                    tar.add(attachment, arcname=attachment.name)
+                name = f"{name}.tar.gz"
+
+            if source.endswith(".tar.gz"):
+                attachment_type = "application/gzip"
+                extension = "tar.gz"
+            elif source.endswith(".svg"):
+                attachment_type = "image/svg+xml"
+                extension = "svg"
+            elif source.endswith(".html"):
+                attachment_type = "text/html"
+                extension = "html"
+            else:
+                attachment_type = "text/plain"
+                extension = attachment.suffix.removeprefix(".")
+
+            allure.attach.file(source, name, attachment_type, extension)
+
+
+GRAFANA_URL = "https://neonprod.grafana.net"
+GRAFANA_EXPLORE_URL = f"{GRAFANA_URL}/explore"
+GRAFANA_TIMELINE_INSPECTOR_DASHBOARD_URL = f"{GRAFANA_URL}/d/8G011dlnk/timeline-inspector"
+LOGS_STAGING_DATASOURCE_ID = "xHHYY0dVz"
+
+
+def allure_add_grafana_links(host: str, timeline_id: TimelineId, start_ms: int, end_ms: int):
+    """Add links to server logs in Grafana to Allure report"""
+    links = {}
+    # We expect host to be in format like ep-divine-night-159320.us-east-2.aws.neon.build
+    endpoint_id, region_id, _ = host.split(".", 2)
+
+    expressions = {
+        "compute logs": f'{{app="compute-node-{endpoint_id}", neon_region="{region_id}"}}',
+        "k8s events": f'{{job="integrations/kubernetes/eventhandler"}} |~ "name=compute-node-{endpoint_id}-"',
+        "console logs": f'{{neon_service="console", neon_region="{region_id}"}} | json | endpoint_id = "{endpoint_id}"',
+        "proxy logs": f'{{neon_service="proxy-scram", neon_region="{region_id}"}}',
+    }
+
+    params: Dict[str, Any] = {
+        "datasource": LOGS_STAGING_DATASOURCE_ID,
+        "queries": [
+            {
+                "expr": "<PUT AN EXPRESSION HERE>",
+                "refId": "A",
+                "datasource": {"type": "loki", "uid": LOGS_STAGING_DATASOURCE_ID},
+                "editorMode": "code",
+                "queryType": "range",
+            }
+        ],
+        "range": {
+            "from": str(start_ms),
+            "to": str(end_ms),
+        },
+    }
+    for name, expr in expressions.items():
+        params["queries"][0]["expr"] = expr
+        query_string = urlencode({"orgId": 1, "left": json.dumps(params)})
+        links[name] = f"{GRAFANA_EXPLORE_URL}?{query_string}"
+
+    timeline_qs = urlencode(
+        {
+            "orgId": 1,
+            "var-environment": "victoria-metrics-aws-dev",
+            "var-timeline_id": timeline_id,
+            "var-endpoint_id": endpoint_id,
+            "var-log_datasource": "grafanacloud-neonstaging-logs",
+            "from": start_ms,
+            "to": end_ms,
+        }
+    )
+    link = f"{GRAFANA_TIMELINE_INSPECTOR_DASHBOARD_URL}?{timeline_qs}"
+    links["Timeline Inspector"] = link
+
+    for name, link in links.items():
+        allure.dynamic.link(link, name=name)
+        log.info(f"{name}: {link}")
+
+
+def start_in_background(
+    command: list[str], cwd: Path, log_file_name: str, is_started: Fn
+) -> subprocess.Popen[bytes]:
+    """Starts a process, creates the logfile and redirects stderr and stdout there. Runs the start checks before the process is started, or errors."""
+
+    log.info(f'Running command "{" ".join(command)}"')
+
+    with open(cwd / log_file_name, "wb") as log_file:
+        spawned_process = subprocess.Popen(command, stdout=log_file, stderr=log_file, cwd=cwd)
+        error = None
+        try:
+            return_code = spawned_process.poll()
+            if return_code is not None:
+                error = f"expected subprocess to run but it exited with code {return_code}"
+            else:
+                attempts = 10
+                try:
+                    wait_until(
+                        number_of_iterations=attempts,
+                        interval=1,
+                        func=is_started,
+                    )
+                except Exception:
+                    error = f"Failed to get correct status from subprocess in {attempts} attempts"
+        except Exception as e:
+            error = f"expected subprocess to start but it failed with exception: {e}"
+
+        if error is not None:
+            log.error(error)
+            spawned_process.kill()
+            raise Exception(f"Failed to run subprocess as {command}, reason: {error}")
+
+        log.info("subprocess spawned")
+        return spawned_process
+
+
+def wait_until(number_of_iterations: int, interval: float, func: Fn):
+    """
+    Wait until 'func' returns successfully, without exception. Returns the
+    last return value from the function.
+    """
+    last_exception = None
+    for i in range(number_of_iterations):
+        try:
+            res = func()
+        except Exception as e:
+            log.info("waiting for %s iteration %s failed", func, i + 1)
+            last_exception = e
+            time.sleep(interval)
+            continue
+        return res
+    raise Exception("timed out while waiting for %s" % func) from last_exception
+
+
+def wait_while(number_of_iterations: int, interval: float, func):
+    """
+    Wait until 'func' returns false, or throws an exception.
+    """
+    for i in range(number_of_iterations):
+        try:
+            if not func():
+                return
+            log.info("waiting for %s iteration %s failed", func, i + 1)
+            time.sleep(interval)
+            continue
+        except Exception:
+            return
+    raise Exception("timed out while waiting for %s" % func)
