@@ -10,45 +10,14 @@
 //! This is similar to PostgreSQL's virtual file descriptor facility in
 //! src/backend/storage/file/fd.c
 //!
-use lazy_static::lazy_static;
-use std::fs::{File, OpenOptions};
+use crate::metrics::{STORAGE_IO_SIZE, STORAGE_IO_TIME};
+use once_cell::sync::OnceCell;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockWriteGuard};
-use zenith_metrics::{register_histogram_vec, register_int_gauge_vec, HistogramVec, IntGaugeVec};
-
-use once_cell::sync::OnceCell;
-
-// Metrics collected on disk IO operations
-const STORAGE_IO_TIME_BUCKETS: &[f64] = &[
-    0.000001, // 1 usec
-    0.00001,  // 10 usec
-    0.0001,   // 100 usec
-    0.001,    // 1 msec
-    0.01,     // 10 msec
-    0.1,      // 100 msec
-    1.0,      // 1 sec
-];
-
-lazy_static! {
-    static ref STORAGE_IO_TIME: HistogramVec = register_histogram_vec!(
-        "pageserver_io_time",
-        "Time spent in IO operations",
-        &["operation", "tenant_id", "timeline_id"],
-        STORAGE_IO_TIME_BUCKETS.into()
-    )
-    .expect("failed to define a metric");
-}
-lazy_static! {
-    static ref STORAGE_IO_SIZE: IntGaugeVec = register_int_gauge_vec!(
-        "pageserver_io_size",
-        "Amount of bytes",
-        &["operation", "tenant_id", "timeline_id"]
-    )
-    .expect("failed to define a metric");
-}
 
 ///
 /// A virtual file descriptor. You can use this just like std::fs::File, but internally
@@ -65,6 +34,7 @@ lazy_static! {
 /// currently open, the 'handle' can still point to the slot where it was last kept. The
 /// 'tag' field is used to detect whether the handle still is valid or not.
 ///
+#[derive(Debug)]
 pub struct VirtualFile {
     /// Lazy handle to the global file descriptor cache. The slot that this points to
     /// might contain our File, or it may be empty, or it may contain a File that
@@ -83,12 +53,14 @@ pub struct VirtualFile {
     pub path: PathBuf,
     open_options: OpenOptions,
 
-    /// For metrics
-    tenantid: String,
-    timelineid: String,
+    // These are strings becase we only use them for metrics, and those expect strings.
+    // It makes no sense for us to constantly turn the `TimelineId` and `TenantId` into
+    // strings.
+    tenant_id: String,
+    timeline_id: String,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 struct SlotHandle {
     /// Index into OPEN_FILES.slots
     index: usize,
@@ -180,12 +152,10 @@ impl OpenFiles {
         // old file.
         //
         if let Some(old_file) = slot_guard.file.take() {
-            // We do not have information about tenantid/timelineid of evicted file.
-            // It is possible to store path together with file or use filepath crate,
-            // but as far as close() is not expected to be fast, it is not so critical to gather
-            // precise per-tenant statistic here.
+            // the normal path of dropping VirtualFile uses "close", use "close-by-replace" here to
+            // distinguish the two.
             STORAGE_IO_TIME
-                .with_label_values(&["close", "-", "-"])
+                .with_label_values(&["close-by-replace"])
                 .observe_closure_duration(|| drop(old_file));
         }
 
@@ -226,19 +196,20 @@ impl VirtualFile {
         path: &Path,
         open_options: &OpenOptions,
     ) -> Result<VirtualFile, std::io::Error> {
-        let parts = path.to_str().unwrap().split('/').collect::<Vec<&str>>();
-        let tenantid;
-        let timelineid;
+        let path_str = path.to_string_lossy();
+        let parts = path_str.split('/').collect::<Vec<&str>>();
+        let tenant_id;
+        let timeline_id;
         if parts.len() > 5 && parts[parts.len() - 5] == "tenants" {
-            tenantid = parts[parts.len() - 4].to_string();
-            timelineid = parts[parts.len() - 2].to_string();
+            tenant_id = parts[parts.len() - 4].to_string();
+            timeline_id = parts[parts.len() - 2].to_string();
         } else {
-            tenantid = "*".to_string();
-            timelineid = "*".to_string();
+            tenant_id = "*".to_string();
+            timeline_id = "*".to_string();
         }
         let (handle, mut slot_guard) = get_open_files().find_victim_slot();
         let file = STORAGE_IO_TIME
-            .with_label_values(&["open", &tenantid, &timelineid])
+            .with_label_values(&["open"])
             .observe_closure_duration(|| open_options.open(path))?;
 
         // Strip all options other than read and write.
@@ -256,8 +227,8 @@ impl VirtualFile {
             pos: 0,
             path: path.to_path_buf(),
             open_options: reopen_options,
-            tenantid,
-            timelineid,
+            tenant_id,
+            timeline_id,
         };
 
         slot_guard.file.replace(file);
@@ -268,6 +239,10 @@ impl VirtualFile {
     /// Call File::sync_all() on the underlying File.
     pub fn sync_all(&self) -> Result<(), Error> {
         self.with_file("fsync", |file| file.sync_all())?
+    }
+
+    pub fn metadata(&self) -> Result<fs::Metadata, Error> {
+        self.with_file("metadata", |file| file.metadata())?
     }
 
     /// Helper function that looks up the underlying File for this VirtualFile,
@@ -297,7 +272,7 @@ impl VirtualFile {
                             // Found a cached file descriptor.
                             slot.recently_used.store(true, Ordering::Relaxed);
                             return Ok(STORAGE_IO_TIME
-                                .with_label_values(&[op, &self.tenantid, &self.timelineid])
+                                .with_label_values(&[op])
                                 .observe_closure_duration(|| func(file)));
                         }
                     }
@@ -324,21 +299,12 @@ impl VirtualFile {
 
         // Open the physical file
         let file = STORAGE_IO_TIME
-            .with_label_values(&["open", &self.tenantid, &self.timelineid])
+            .with_label_values(&["open"])
             .observe_closure_duration(|| self.open_options.open(&self.path))?;
 
         // Perform the requested operation on it
-        //
-        // TODO: We could downgrade the locks to read mode before calling
-        // 'func', to allow a little bit more concurrency, but the standard
-        // library RwLock doesn't allow downgrading without releasing the lock,
-        // and that doesn't seem worth the trouble.
-        //
-        // XXX: `parking_lot::RwLock` can enable such downgrades, yet its implemenation is fair and
-        // may deadlock on subsequent read calls.
-        // Simply replacing all `RwLock` in project causes deadlocks, so use it sparingly.
         let result = STORAGE_IO_TIME
-            .with_label_values(&[op, &self.tenantid, &self.timelineid])
+            .with_label_values(&[op])
             .observe_closure_duration(|| func(&file));
 
         // Store the File in the slot and update the handle in the VirtualFile
@@ -348,6 +314,12 @@ impl VirtualFile {
         *handle_guard = handle;
 
         Ok(result)
+    }
+
+    pub fn remove(self) {
+        let path = self.path.clone();
+        drop(self);
+        std::fs::remove_file(path).expect("failed to remove the virtual file");
     }
 }
 
@@ -362,13 +334,11 @@ impl Drop for VirtualFile {
         let mut slot_guard = slot.inner.write().unwrap();
         if slot_guard.tag == handle.tag {
             slot.recently_used.store(false, Ordering::Relaxed);
-            // Unlike files evicted by replacement algorithm, here
-            // we group close time by tenantid/timelineid.
-            // At allows to compare number/time of "normal" file closes
-            // with file eviction.
+            // there is also operation "close-by-replace" for closes done on eviction for
+            // comparison.
             STORAGE_IO_TIME
-                .with_label_values(&["close", &self.tenantid, &self.timelineid])
-                .observe_closure_duration(|| slot_guard.file.take());
+                .with_label_values(&["close"])
+                .observe_closure_duration(|| drop(slot_guard.file.take()));
         }
     }
 }
@@ -429,7 +399,7 @@ impl FileExt for VirtualFile {
         let result = self.with_file("read", |file| file.read_at(buf, offset))?;
         if let Ok(size) = result {
             STORAGE_IO_SIZE
-                .with_label_values(&["read", &self.tenantid, &self.timelineid])
+                .with_label_values(&["read", &self.tenant_id, &self.timeline_id])
                 .add(size as i64);
         }
         result
@@ -439,7 +409,7 @@ impl FileExt for VirtualFile {
         let result = self.with_file("write", |file| file.write_at(buf, offset))?;
         if let Ok(size) = result {
             STORAGE_IO_SIZE
-                .with_label_values(&["write", &self.tenantid, &self.timelineid])
+                .with_label_values(&["write", &self.tenant_id, &self.timeline_id])
                 .add(size as i64);
         }
         result
