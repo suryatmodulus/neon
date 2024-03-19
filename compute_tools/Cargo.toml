@@ -1,19 +1,40 @@
 [package]
 name = "compute_tools"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-libc = "0.2"
-anyhow = "1.0"
-chrono = "0.4"
-clap = "3.0"
-env_logger = "0.9"
-hyper = { version = "0.14", features = ["full"] }
-log = { version = "0.4", features = ["std", "serde"] }
-postgres = { git = "https://github.com/zenithdb/rust-postgres.git", rev="9eb0dbfbeb6a6c1b79099b9f7ae4a8c021877858" }
-regex = "1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1"
-tar = "0.4"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+anyhow.workspace = true
+async-compression.workspace = true
+chrono.workspace = true
+cfg-if.workspace = true
+clap.workspace = true
+flate2.workspace = true
+futures.workspace = true
+hyper = { workspace = true, features = ["full"] }
+notify.workspace = true
+num_cpus.workspace = true
+opentelemetry.workspace = true
+postgres.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+tokio-postgres.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+tracing-utils.workspace = true
+url.workspace = true
+
+compute_api.workspace = true
+utils.workspace = true
+workspace_hack.workspace = true
+toml_edit.workspace = true
+remote_storage = { version = "0.1", path = "../libs/remote_storage/" }
+vm_monitor = { version = "0.1", path = "../libs/vm_monitor/" }
+zstd = "0.12.4"
